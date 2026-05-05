@@ -1,0 +1,3 @@
+[submodule "StackChan-official"]
+	path = StackChan-official
+	url = https://github.com/m5stack/StackChan.git
