@@ -2449,3 +2449,152 @@ index 0000000..30127eb
 +CONFIG_PARTITION_TABLE_CUSTOM=y
 +CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_sticks3.csv"
 +CONFIG_PARTITION_TABLE_FILENAME="partitions_sticks3.csv"
+diff --git a/remote/code/main/StackChan-RemoteControl-ESPNow.cpp b/remote/code/main/StackChan-RemoteControl-ESPNow.cpp
+index b9bb95f..54864da 100644
+--- a/remote/code/main/StackChan-RemoteControl-ESPNow.cpp
++++ b/remote/code/main/StackChan-RemoteControl-ESPNow.cpp
+@@ -19,6 +19,78 @@ using namespace m5;
+ 
+ joystick_data_t joystick_data;
+ 
++static constexpr uint8_t DISPLAY_BRIGHTNESS_NORMAL = 35;
++static constexpr uint8_t DISPLAY_BRIGHTNESS_LOW_BAT = 18;
++static constexpr uint8_t DISPLAY_BRIGHTNESS_CHARGING = 12;
++static constexpr int8_t LOW_BATTERY_ENTER_THRESHOLD = 22;
++static constexpr int8_t LOW_BATTERY_EXIT_THRESHOLD = 32;
++static constexpr TickType_t POWER_PROFILE_STABLE_TICKS = pdMS_TO_TICKS(5000);
++
++enum power_display_mode_t : uint8_t {
++    POWER_DISPLAY_NORMAL,
++    POWER_DISPLAY_LOW_BATTERY,
++    POWER_DISPLAY_CHARGING,
++};
++
++static uint8_t brightness_for_mode(power_display_mode_t mode)
++{
++    switch (mode) {
++    case POWER_DISPLAY_CHARGING:
++        return DISPLAY_BRIGHTNESS_CHARGING;
++    case POWER_DISPLAY_LOW_BATTERY:
++        return DISPLAY_BRIGHTNESS_LOW_BAT;
++    case POWER_DISPLAY_NORMAL:
++    default:
++        return DISPLAY_BRIGHTNESS_NORMAL;
++    }
++}
++
++static void apply_power_profile(int8_t battery_level, bool charging)
++{
++    static uint8_t current_brightness = 0xFF;
++    static power_display_mode_t active_mode = POWER_DISPLAY_NORMAL;
++    static power_display_mode_t pending_mode = POWER_DISPLAY_NORMAL;
++    static TickType_t pending_since = 0;
++    static bool low_battery_mode = false;
++    static bool initialized = false;
++
++    if (battery_level > 0) {
++        if (battery_level <= LOW_BATTERY_ENTER_THRESHOLD) {
++            low_battery_mode = true;
++        } else if (battery_level >= LOW_BATTERY_EXIT_THRESHOLD) {
++            low_battery_mode = false;
++        }
++    }
++
++    power_display_mode_t requested_mode = POWER_DISPLAY_NORMAL;
++    if (charging) {
++        requested_mode = POWER_DISPLAY_CHARGING;
++    } else if (low_battery_mode) {
++        requested_mode = POWER_DISPLAY_LOW_BATTERY;
++    }
++
++    TickType_t now = xTaskGetTickCount();
++    if (!initialized) {
++        active_mode = requested_mode;
++        pending_mode = requested_mode;
++        initialized = true;
++    } else if (requested_mode == active_mode) {
++        pending_mode = requested_mode;
++        pending_since = now;
++    } else if (requested_mode != pending_mode) {
++        pending_mode = requested_mode;
++        pending_since = now;
++    } else if ((now - pending_since) >= POWER_PROFILE_STABLE_TICKS) {
++        active_mode = requested_mode;
++    }
++
++    uint8_t target_brightness = brightness_for_mode(active_mode);
++    if (current_brightness != target_brightness) {
++        M5.Display.setBrightness(target_brightness);
++        current_brightness = target_brightness;
++    }
++}
++
+ // extern void lvgl_port_init(M5GFX &gfx);
+ 
+ /**
+@@ -89,7 +161,9 @@ void app_main(void)
+     auto cfg = M5.config();
+     M5.begin(cfg);
+     M5.Power.begin();
++    M5.Power.setBatteryCharge(true);
+     M5.Power.setExtOutput(true);  // Enable StickS3 Grove/Hat 5V output for Unit Joystick2.
++    apply_power_profile(100, false);
+     M5.Imu.init(&M5.In_I2C);        // init IMU with internal I2C port
+     printf("IN_I2C port: %d\n", M5.In_I2C.getPort());
+     printf("M5 Display width: %ld, height: %ld\n", M5.Display.width(), M5.Display.height());
+@@ -115,6 +189,7 @@ void app_main(void)
+ 
+         joystick_data.bat = (joystick_data.bat > 100) ? 100 : joystick_data.bat;
+         joystick_data.bat = (joystick_data.bat < 0) ? 0 : joystick_data.bat;
++        apply_power_profile(joystick_data.bat, M5.Power.isCharging() == Power_Class::is_charging);
+ 
+         M5.Imu.update();                              // update IMU data
+         imu_data              = M5.Imu.getImuData();  // get IMU data
+diff --git a/remote/code/main/joystick/joystick_handle.c b/remote/code/main/joystick/joystick_handle.c
+index daac361..861060f 100644
+--- a/remote/code/main/joystick/joystick_handle.c
++++ b/remote/code/main/joystick/joystick_handle.c
+@@ -15,6 +15,7 @@ i2c_bus_device_handle_t i2c_device1;  // i2c device handle
+ #define JOYSTICK_NVS_NAMESPACE "joy_cfg"
+ #define JOYSTICK_NVS_INVERT_X  "invert_x"
+ #define JOYSTICK_NVS_INVERT_Y  "invert_y"
++#define RUNNING_LOOP_DELAY_MS   50
+ 
+ /**
+  * @brief Initialize joystick via I2C interface
+@@ -246,7 +247,7 @@ void handle_running_screen(void *pvParam)
+                     pkt[7] = joystick_data->btnB_status;
+                     espnow_send_data(pkt, sizeof(pkt));
+                 }
+-                vTaskDelay(30 / portTICK_PERIOD_MS);
++                vTaskDelay(RUNNING_LOOP_DELAY_MS / portTICK_PERIOD_MS);
+                 continue;
+             }
+ 
+@@ -264,7 +265,7 @@ void handle_running_screen(void *pvParam)
+             last_yaw   = yaw_angle;
+             last_pitch = pitch_angle;
+             espnow_send_data(pkt, sizeof(pkt));
+-            vTaskDelay(30 / portTICK_PERIOD_MS);
++            vTaskDelay(RUNNING_LOOP_DELAY_MS / portTICK_PERIOD_MS);
+         } else {
+             vTaskDelay(200 / portTICK_PERIOD_MS);
+         }
+@@ -324,7 +325,7 @@ void handle_imu_screen(void *pvParam)
+             pitch_angle = (int16_t)map(limited_pitch, 0, 1.5, 900, 0);
+ 
+             if (abs(yaw_angle - last_yaw) < 10 && abs(last_pitch - pitch_angle) < 10) {
+-                vTaskDelay(30 / portTICK_PERIOD_MS);
++                vTaskDelay(RUNNING_LOOP_DELAY_MS / portTICK_PERIOD_MS);
+                 continue;
+             }
+             last_yaw   = yaw_angle;
+@@ -342,7 +343,7 @@ void handle_imu_screen(void *pvParam)
+                                             imu_angle.roll, imu_angle.pitch, yaw_angle, pitch_angle);
+ #endif
+ 
+-            vTaskDelay(30 / portTICK_PERIOD_MS);
++            vTaskDelay(RUNNING_LOOP_DELAY_MS / portTICK_PERIOD_MS);
+         } else {
+             vTaskDelay(200 / portTICK_PERIOD_MS);
+         }

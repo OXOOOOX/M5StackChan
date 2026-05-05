@@ -9,7 +9,7 @@ The physical controller enclosure is based on this MakerWorld model:
 ## Firmware
 
 ```text
-StackChan-RemoteControl-StickS3-Joystick2_0x3.bin
+StackChan-RemoteControl-StickS3-Joystick2_0x5.bin
 ```
 
 This is the final M5Burner-ready firmware image. Burn it at offset `0x0` with M5Burner `User Custom`.
@@ -27,6 +27,8 @@ The patch adapts the upstream StackChan remote firmware for:
 * 8MB StickS3 flash partition layout
 * Joystick X/Y inversion settings
 * NVS persistence for joystick inversion after reboot
+* Lower display brightness and a slower control loop to reduce battery voltage sag
+* Debounced charging brightness changes to avoid USB plug-in flicker
 
 ## Source Patch
 
@@ -55,7 +57,7 @@ package_sticks3_m5burner.cmd
 The final generated M5Burner image used by this repository is:
 
 ```text
-C:\Users\23479\Documents\GitHub\M5StackChan\StackChan-RemoteControl-StickS3-Joystick2_0x3.bin
+C:\Users\23479\Documents\GitHub\M5StackChan\StackChan-RemoteControl-StickS3-Joystick2_0x5.bin
 ```
 
 ## Hardware
