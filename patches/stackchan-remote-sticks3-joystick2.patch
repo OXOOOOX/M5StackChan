@@ -1,3 +1,40 @@
+﻿diff --git a/firmware/main/apps/app_espnow_ctrl/app_espnow_ctrl.cpp b/firmware/main/apps/app_espnow_ctrl/app_espnow_ctrl.cpp
+index f85ce60..90ae34e 100644
+--- a/firmware/main/apps/app_espnow_ctrl/app_espnow_ctrl.cpp
++++ b/firmware/main/apps/app_espnow_ctrl/app_espnow_ctrl.cpp
+@@ -165,7 +165,13 @@ void handle_received_data()
+     // pitch: 0 ~ 900
+     // speed: 0 ~ 1000, suggest 600
+     // laser-enabled: 0 = off, 1 = on
+-    if (_received_data.size() >= 8) {
++    if (_received_data.size() != 8) {
++        mclog::warn("ignore remote packet with invalid size: {}", _received_data.size());
++        _received_data.clear();
++        return;
++    }
++
++    if (_received_data.size() == 8) {
+         uint8_t target_id = _received_data[0];
+         if (target_id != 0 && target_id != _receiver_id) {
+             mclog::info("not me, target id: {}", target_id);
+@@ -178,6 +184,17 @@ void handle_received_data()
+         int16_t speed       = static_cast<int16_t>(_received_data[5] | (_received_data[6] << 8));
+         bool laser_enabled  = (_received_data[7] != 0);
+ 
++        mclog::info("raw: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}", _received_data[0],
++                    _received_data[1], _received_data[2], _received_data[3], _received_data[4], _received_data[5],
++                    _received_data[6], _received_data[7]);
++
++        if (yaw_angle < -1280 || yaw_angle > 1280 || pitch_angle < 0 || pitch_angle > 900 || speed < 0 ||
++            speed > 1000) {
++            mclog::warn("ignore invalid remote packet, yaw: {}, pitch: {}, speed: {}", yaw_angle, pitch_angle, speed);
++            _received_data.clear();
++            return;
++        }
++
+         mclog::info("yaw: {}, pitch: {}, speed: {}, laser: {}", yaw_angle, pitch_angle, speed, laser_enabled);
+ 
+         auto& motion = GetStackChan().motion();
 diff --git a/remote/code/README.md b/remote/code/README.md
 index 9cec961..04a30e1 100644
 --- a/remote/code/README.md
@@ -177,10 +214,86 @@ index 8c14b31..747f00e 100644
      ui/updown_img.c
      lvgl_port.cpp
 diff --git a/remote/code/main/StackChan-RemoteControl-ESPNow.cpp b/remote/code/main/StackChan-RemoteControl-ESPNow.cpp
-index 7df07d4..b9bb95f 100644
+index 7df07d4..54864da 100644
 --- a/remote/code/main/StackChan-RemoteControl-ESPNow.cpp
 +++ b/remote/code/main/StackChan-RemoteControl-ESPNow.cpp
-@@ -23,29 +23,41 @@ joystick_data_t joystick_data;
+@@ -19,33 +19,117 @@ using namespace m5;
+ 
+ joystick_data_t joystick_data;
+ 
++static constexpr uint8_t DISPLAY_BRIGHTNESS_NORMAL = 35;
++static constexpr uint8_t DISPLAY_BRIGHTNESS_LOW_BAT = 18;
++static constexpr uint8_t DISPLAY_BRIGHTNESS_CHARGING = 12;
++static constexpr int8_t LOW_BATTERY_ENTER_THRESHOLD = 22;
++static constexpr int8_t LOW_BATTERY_EXIT_THRESHOLD = 32;
++static constexpr TickType_t POWER_PROFILE_STABLE_TICKS = pdMS_TO_TICKS(5000);
++
++enum power_display_mode_t : uint8_t {
++    POWER_DISPLAY_NORMAL,
++    POWER_DISPLAY_LOW_BATTERY,
++    POWER_DISPLAY_CHARGING,
++};
++
++static uint8_t brightness_for_mode(power_display_mode_t mode)
++{
++    switch (mode) {
++    case POWER_DISPLAY_CHARGING:
++        return DISPLAY_BRIGHTNESS_CHARGING;
++    case POWER_DISPLAY_LOW_BATTERY:
++        return DISPLAY_BRIGHTNESS_LOW_BAT;
++    case POWER_DISPLAY_NORMAL:
++    default:
++        return DISPLAY_BRIGHTNESS_NORMAL;
++    }
++}
++
++static void apply_power_profile(int8_t battery_level, bool charging)
++{
++    static uint8_t current_brightness = 0xFF;
++    static power_display_mode_t active_mode = POWER_DISPLAY_NORMAL;
++    static power_display_mode_t pending_mode = POWER_DISPLAY_NORMAL;
++    static TickType_t pending_since = 0;
++    static bool low_battery_mode = false;
++    static bool initialized = false;
++
++    if (battery_level > 0) {
++        if (battery_level <= LOW_BATTERY_ENTER_THRESHOLD) {
++            low_battery_mode = true;
++        } else if (battery_level >= LOW_BATTERY_EXIT_THRESHOLD) {
++            low_battery_mode = false;
++        }
++    }
++
++    power_display_mode_t requested_mode = POWER_DISPLAY_NORMAL;
++    if (charging) {
++        requested_mode = POWER_DISPLAY_CHARGING;
++    } else if (low_battery_mode) {
++        requested_mode = POWER_DISPLAY_LOW_BATTERY;
++    }
++
++    TickType_t now = xTaskGetTickCount();
++    if (!initialized) {
++        active_mode = requested_mode;
++        pending_mode = requested_mode;
++        initialized = true;
++    } else if (requested_mode == active_mode) {
++        pending_mode = requested_mode;
++        pending_since = now;
++    } else if (requested_mode != pending_mode) {
++        pending_mode = requested_mode;
++        pending_since = now;
++    } else if ((now - pending_since) >= POWER_PROFILE_STABLE_TICKS) {
++        active_mode = requested_mode;
++    }
++
++    uint8_t target_brightness = brightness_for_mode(active_mode);
++    if (current_brightness != target_brightness) {
++        M5.Display.setBrightness(target_brightness);
++        current_brightness = target_brightness;
++    }
++}
++
+ // extern void lvgl_port_init(M5GFX &gfx);
  
  /**
   * @brief Handle Button Press.
@@ -231,7 +344,7 @@ index 7df07d4..b9bb95f 100644
              joystick_data.screen_mode = MODE_IMU;
              switch_screen(joystick_data.screen_mode);
          }
-@@ -53,6 +65,10 @@ void handle_button_press()
+@@ -53,6 +137,10 @@ void handle_button_press()
      if (M5.BtnB.wasPressed()) {
          if (joystick_data.screen_mode == MODE_SETUP) {
              joystick_data.select_mode = !joystick_data.select_mode;
@@ -242,7 +355,7 @@ index 7df07d4..b9bb95f 100644
          } else if ((joystick_data.screen_mode == MODE_RUNNING) || (joystick_data.screen_mode == MODE_IMU)) {
              joystick_data.btnB_status = !joystick_data.btnB_status;
          }
-@@ -70,9 +86,10 @@ void app_main(void)
+@@ -70,9 +158,12 @@ void app_main(void)
          ret = nvs_flash_init();
      }
  
@@ -251,11 +364,13 @@ index 7df07d4..b9bb95f 100644
 +    M5.begin(cfg);
      M5.Power.begin();
 -    M5.Power.Axp192.setLDO2(2800);  // set LDO2 to 2.8V for external devices
++    M5.Power.setBatteryCharge(true);
 +    M5.Power.setExtOutput(true);  // Enable StickS3 Grove/Hat 5V output for Unit Joystick2.
++    apply_power_profile(100, false);
      M5.Imu.init(&M5.In_I2C);        // init IMU with internal I2C port
      printf("IN_I2C port: %d\n", M5.In_I2C.getPort());
      printf("M5 Display width: %ld, height: %ld\n", M5.Display.width(), M5.Display.height());
-@@ -88,12 +105,13 @@ void app_main(void)
+@@ -88,15 +179,17 @@ void app_main(void)
      xTaskCreate(handle_setup_screen, "handle_setup_screen", 8192, &joystick_data, 5, NULL);      // handle setup mode
      xTaskCreate(handle_running_screen, "handle_running_screen", 8192, &joystick_data, 5, NULL);  // handle running mode
      xTaskCreate(handle_imu_screen, "handle_imu_screen", 8192, &joystick_data, 5, NULL);
@@ -270,13 +385,155 @@ index 7df07d4..b9bb95f 100644
  
          joystick_data.bat = (joystick_data.bat > 100) ? 100 : joystick_data.bat;
          joystick_data.bat = (joystick_data.bat < 0) ? 0 : joystick_data.bat;
-@@ -112,4 +130,4 @@ void app_main(void)
++        apply_power_profile(joystick_data.bat, M5.Power.isCharging() == Power_Class::is_charging);
+ 
+         M5.Imu.update();                              // update IMU data
+         imu_data              = M5.Imu.getImuData();  // get IMU data
+@@ -112,4 +205,4 @@ void app_main(void)
          vTaskDelay(20 / portTICK_PERIOD_MS);
      }
  }
 -}
 \ No newline at end of file
 +}
+diff --git a/remote/code/main/esp_now/esp_now_init.c b/remote/code/main/esp_now/esp_now_init.c
+index 71277f2..2966f1a 100644
+--- a/remote/code/main/esp_now/esp_now_init.c
++++ b/remote/code/main/esp_now/esp_now_init.c
+@@ -1,5 +1,25 @@
+ 
+ #include "esp_now_init.h"
++#include "esp_log.h"
++#include <string.h>
++
++static const uint8_t s_broadcast_addr[ESP_NOW_ETH_ALEN] = {
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++};
++
++static void add_broadcast_peer(uint8_t channel)
++{
++    esp_now_peer_info_t peer = {0};
++    memcpy(peer.peer_addr, s_broadcast_addr, ESP_NOW_ETH_ALEN);
++    peer.channel = channel;
++    peer.ifidx   = WIFI_IF_STA;
++    peer.encrypt = false;
++
++    esp_err_t ret = esp_now_add_peer(&peer);
++    if (ret != ESP_OK && ret != ESP_ERR_ESPNOW_EXIST) {
++        ESP_ERROR_CHECK(ret);
++    }
++}
+ 
+ /**
+  * @brief Initialize WiFi in STA mode and ESP-NOW with the specified channel
+@@ -13,10 +33,9 @@
+  *      5. Configures WiFi mode to Station (STA)
+  *      6. Starts WiFi
+  *      7. Sets the specified WiFi channel
+- *      8. Optionally enables long range protocol if CONFIG_ESPNOW_ENABLE_LONG_RANGE is defined
+- *      9. Configures ESP-NOW with forwarding disabled, 5 retry attempts, and receive disabled
+- *      10. Initializes ESP-NOW with the configured parameters
+- *      11. Reads and logs the device MAC address
++ *      8. Initializes native ESP-NOW
++ *      9. Adds broadcast peer for raw 8-byte payload compatibility with MicroPython/UIFlow receivers
++ *      10. Reads and logs the device MAC address
+  * @warning This function combines both WiFi and ESP-NOW initialization in a single call
+  */
+ void wifi_espnow_init(uint8_t channel)
+@@ -31,18 +50,11 @@ void wifi_espnow_init(uint8_t channel)
+     ESP_ERROR_CHECK(esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE));
+ 
+ #if CONFIG_ESPNOW_ENABLE_LONG_RANGE
+-    ESP_ERROR_CHECK(esp_wifi_set_protocol(
+-        ESPNOW_WIFI_IF, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR));
++    ESP_ERROR_CHECK(
++        esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR));
+ #endif
+-    espnow_config_t espnow_config = ESPNOW_INIT_CONFIG_DEFAULT();
+-
+-    espnow_config.forward_enable         = false;
+-    espnow_config.forward_switch_channel = false;
+-    espnow_config.send_retry_num         = 5;
+-    espnow_config.receive_enable.forward = false;
+-    espnow_config.receive_enable.data    = false;
+-
+-    espnow_init(&espnow_config);
++    ESP_ERROR_CHECK(esp_now_init());
++    add_broadcast_peer(channel);
+ 
+     uint8_t mac[6];
+     esp_read_mac(mac, ESP_MAC_EFUSE_FACTORY);
+@@ -74,7 +86,7 @@ int wifi_espnow_reinit(uint8_t new_channel)
+     // ESP_LOGI("reinit", "Reinitializing WiFi and ESP-NOW with channel: %d", new_channel);
+ 
+     // 1. Deinitialize ESP-NOW
+-    espnow_deinit();
++    ESP_ERROR_CHECK(esp_now_deinit());
+ 
+     // 2. Stop WiFi
+     ESP_ERROR_CHECK(esp_wifi_stop());
+@@ -85,15 +97,9 @@ int wifi_espnow_reinit(uint8_t new_channel)
+ 
+     // ESP_LOGI("reinit", "WiFi channel set to: %d", new_channel);
+ 
+-    // 4. Reinitialize ESP-NOW
+-    espnow_config_t espnow_config        = ESPNOW_INIT_CONFIG_DEFAULT();
+-    espnow_config.forward_enable         = false;
+-    espnow_config.forward_switch_channel = false;
+-    espnow_config.send_retry_num         = 5;
+-    espnow_config.receive_enable.forward = false;
+-    espnow_config.receive_enable.data    = false;
+-
+-    espnow_init(&espnow_config);
++    // 4. Reinitialize native ESP-NOW
++    ESP_ERROR_CHECK(esp_now_init());
++    add_broadcast_peer(new_channel);
+ 
+     uint8_t mac[6];
+     esp_read_mac(mac, ESP_MAC_EFUSE_FACTORY);
+@@ -111,13 +117,11 @@ int wifi_espnow_reinit(uint8_t new_channel)
+  * @param len Length of the data packet in bytes
+  * @note This function sends data using ESP-NOW broadcast address
+  * @details
+- *      1. Creates default ESP-NOW frame header
+- *      2. Sends data using ESPNOW_DATA_TYPE_DATA type
+- *      3. Uses broadcast address to send to all devices on the same channel
+- *      4. Blocks until transmission completes (portMAX_DELAY timeout)
++ *      1. Sends the payload directly with native ESP-NOW
++ *      2. Uses broadcast address to send to all devices on the same channel
++ *      3. Keeps payload bytes unchanged for MicroPython/UIFlow ESP-NOW receivers
+  */
+ void espnow_send_data(uint8_t *pkt, size_t len)
+ {
+-    espnow_frame_head_t frame_head = ESPNOW_FRAME_CONFIG_DEFAULT();
+-    ESP_ERROR_CHECK(espnow_send(ESPNOW_DATA_TYPE_DATA, ESPNOW_ADDR_BROADCAST, pkt, len, &frame_head, portMAX_DELAY));
+-}
+\ No newline at end of file
++    ESP_ERROR_CHECK(esp_now_send(s_broadcast_addr, pkt, len));
++}
+diff --git a/remote/code/main/esp_now/esp_now_init.h b/remote/code/main/esp_now/esp_now_init.h
+index bcd4d12..d74b2fc 100644
+--- a/remote/code/main/esp_now/esp_now_init.h
++++ b/remote/code/main/esp_now/esp_now_init.h
+@@ -6,10 +6,8 @@ extern "C" {
+ #endif
+ 
+ #include "esp_err.h"
++#include "esp_now.h"
+ #include <esp_mac.h>
+-#include <espnow.h>
+-#include <espnow_storage.h>
+-#include <espnow_utils.h>
+ #include "esp_wifi.h"
+ 
+ void wifi_espnow_init(uint8_t channel);
+@@ -20,4 +18,4 @@ void espnow_send_data(uint8_t *pkt, size_t len);
+ }
+ #endif
+ 
+-#endif
+\ No newline at end of file
++#endif
 diff --git a/remote/code/main/idf_component.yml b/remote/code/main/idf_component.yml
 index e62ca39..5e0fe76 100644
 --- a/remote/code/main/idf_component.yml
@@ -340,10 +597,10 @@ index 1a9ad0c..a058f80 100644
 \ No newline at end of file
 +#endif
 diff --git a/remote/code/main/joystick/joystick_handle.c b/remote/code/main/joystick/joystick_handle.c
-index ecd21ee..daac361 100644
+index ecd21ee..4361f85 100644
 --- a/remote/code/main/joystick/joystick_handle.c
 +++ b/remote/code/main/joystick/joystick_handle.c
-@@ -1,31 +1,45 @@
+@@ -1,31 +1,51 @@
  #include "joystick_handle.h"
 +#include "driver/gpio.h"
 +#include "i2c_bus.h"
@@ -361,6 +618,12 @@ index ecd21ee..daac361 100644
 +#define JOYSTICK_NVS_NAMESPACE "joy_cfg"
 +#define JOYSTICK_NVS_INVERT_X  "invert_x"
 +#define JOYSTICK_NVS_INVERT_Y  "invert_y"
++#define RUNNING_LOOP_DELAY_MS   50
++#define REMOTE_PROTOCOL_YAW_MIN   (-1280)
++#define REMOTE_PROTOCOL_YAW_MAX   (1280)
++#define REMOTE_PROTOCOL_PITCH_MIN (0)
++#define REMOTE_PROTOCOL_PITCH_MAX (900)
++#define REMOTE_PROTOCOL_SPEED     (600)
 +
  /**
   * @brief Initialize joystick via I2C interface
@@ -396,7 +659,7 @@ index ecd21ee..daac361 100644
      uint8_t buf[128];
      memset(buf, 0, sizeof(buf));
  
-@@ -36,7 +50,7 @@ static void joystick_i2c_init()
+@@ -36,7 +56,7 @@ static void joystick_i2c_init()
          }
      }
  
@@ -405,7 +668,7 @@ index ecd21ee..daac361 100644
  }
  
  /**
-@@ -66,6 +80,54 @@ static void joystick_read_xy(uint16_t *joyX, uint16_t *joyY)
+@@ -66,6 +86,95 @@ static void joystick_read_xy(uint16_t *joyX, uint16_t *joyY)
      }
  }
  
@@ -415,6 +678,47 @@ index ecd21ee..daac361 100644
 +        return value;
 +    }
 +    return (uint16_t)((uint32_t)min_value + (uint32_t)max_value - (uint32_t)value);
++}
++
++static uint16_t clamp_u16(uint32_t value, uint16_t min_value, uint16_t max_value)
++{
++    if (value < min_value) {
++        return min_value;
++    }
++    if (value > max_value) {
++        return max_value;
++    }
++    return (uint16_t)value;
++}
++
++static int16_t clamp_i16(int32_t value, int16_t min_value, int16_t max_value)
++{
++    if (value < min_value) {
++        return min_value;
++    }
++    if (value > max_value) {
++        return max_value;
++    }
++    return (int16_t)value;
++}
++
++static uint16_t apply_deadzone_u16(uint16_t value, uint16_t center, uint16_t deadzone)
++{
++    int32_t delta = (int32_t)value - (int32_t)center;
++    if (delta > -(int32_t)deadzone && delta < (int32_t)deadzone) {
++        return center;
++    }
++    return value;
++}
++
++static int16_t map_axis_u16_to_i16(uint16_t value, uint16_t in_min, uint16_t in_max, int16_t out_min, int16_t out_max)
++{
++    int32_t mapped = ((int32_t)value - (int32_t)in_min) * ((int32_t)out_max - (int32_t)out_min) /
++                         ((int32_t)in_max - (int32_t)in_min) +
++                     (int32_t)out_min;
++    int16_t clamp_min = (out_min < out_max) ? out_min : out_max;
++    int16_t clamp_max = (out_min < out_max) ? out_max : out_min;
++    return clamp_i16(mapped, clamp_min, clamp_max);
 +}
 +
 +static void joystick_load_settings(joystick_data_t *data)
@@ -460,7 +764,7 @@ index ecd21ee..daac361 100644
  /**
   * @brief Public interface to initialize the joystick and return default configuration
   * @return joystick_data_t Structure containing initialized joystick parameters
-@@ -95,7 +157,11 @@ joystick_data_t joystick_init()
+@@ -95,7 +204,11 @@ joystick_data_t joystick_init()
      tmp.accel_z     = 0.0f;
      tmp.screen_mode = MODE_SETUP;
      tmp.select_mode = CHANNEL_SELECT;
@@ -472,41 +776,115 @@ index ecd21ee..daac361 100644
      return tmp;
  }
  
-@@ -153,21 +219,26 @@ void handle_running_screen(void *pvParam)
+@@ -140,51 +253,56 @@ void handle_running_screen(void *pvParam)
+ {
+     joystick_data_t *joystick_data = (joystick_data_t *)pvParam;
+     // communicate packet
+-    uint8_t pkt[8];
+-    pkt[0]              = joystick_data->id;  // id: 0 for broadcast
++    uint8_t pkt[8]      = {0};
+     int16_t yaw_angle   = 0;
+     int16_t pitch_angle = 0;
+     int16_t last_yaw    = 0;
+     int16_t last_pitch  = 0;
+-    int16_t speed_val   = 600;
++    int16_t speed_val   = REMOTE_PROTOCOL_SPEED;
++    bool last_btnB_status = joystick_data->btnB_status;
+ 
+     while (1) {
+         // update screen and send packet when in running mode
          if (joystick_data->screen_mode == MODE_RUNNING) {
              joystick_read_xy(&joystick_data->joyX, &joystick_data->joyY);
  
+-            if (running_screen != NULL && lv_obj_is_valid(running_screen)) {
+-                update_running_screen(joystick_data->joyX, joystick_data->joyY, joystick_data->channel,
+-                                      joystick_data->id, joystick_data->bat);
+-            }
 +            uint16_t effective_joy_x =
 +                maybe_invert_axis(joystick_data->joyX, joystick_data->invert_x, X_MIN, X_MAX);
 +            uint16_t effective_joy_y =
 +                maybe_invert_axis(joystick_data->joyY, joystick_data->invert_y, Y_MIN, Y_MAX);
-+
-             if (running_screen != NULL && lv_obj_is_valid(running_screen)) {
--                update_running_screen(joystick_data->joyX, joystick_data->joyY, joystick_data->channel,
-+                update_running_screen(effective_joy_x, effective_joy_y, joystick_data->channel,
-                                       joystick_data->id, joystick_data->bat);
-             }
  
-             // handle data from joystick
+-            // handle data from joystick
 -            if ((joystick_data->joyX < X_CENTER + DEAD_ZONE) && (joystick_data->joyX > X_CENTER - DEAD_ZONE)) {
 -                joystick_data->joyX = X_CENTER;
-+            if ((effective_joy_x < X_CENTER + DEAD_ZONE) && (effective_joy_x > X_CENTER - DEAD_ZONE)) {
-+                effective_joy_x = X_CENTER;
-             }
+-            }
 -            if ((joystick_data->joyY < Y_CENTER + DEAD_ZONE) && (joystick_data->joyY > Y_CENTER - DEAD_ZONE)) {
 -                joystick_data->joyY = Y_CENTER;
-+            if ((effective_joy_y < Y_CENTER + DEAD_ZONE) && (effective_joy_y > Y_CENTER - DEAD_ZONE)) {
-+                effective_joy_y = Y_CENTER;
-             }
+-            }
++            effective_joy_x = apply_deadzone_u16(effective_joy_x, X_CENTER, DEAD_ZONE);
++            effective_joy_y = apply_deadzone_u16(effective_joy_y, Y_CENTER, DEAD_ZONE);
++
++            effective_joy_x = clamp_u16(effective_joy_x, X_MIN, X_MAX);
++            effective_joy_y = clamp_u16(effective_joy_y, Y_MIN, Y_MAX);
++
++            yaw_angle =
++                map_axis_u16_to_i16(effective_joy_x, X_MIN, X_MAX, REMOTE_PROTOCOL_YAW_MAX, REMOTE_PROTOCOL_YAW_MIN);
++            pitch_angle = map_axis_u16_to_i16(effective_joy_y, Y_MIN, Y_MAX, REMOTE_PROTOCOL_PITCH_MIN,
++                                              REMOTE_PROTOCOL_PITCH_MAX);
++
++            pkt[0] = joystick_data->id;  // id: 0 for broadcast
++            memcpy(&pkt[1], &yaw_angle, sizeof(int16_t));
++            memcpy(&pkt[3], &pitch_angle, sizeof(int16_t));
++            memcpy(&pkt[5], &speed_val, sizeof(int16_t));
++            pkt[7] = joystick_data->btnB_status;
  
 -            yaw_angle   = (int16_t)map(joystick_data->joyX, X_MIN, X_MAX, 1280, -1280);
 -            pitch_angle = (int16_t)map(joystick_data->joyY, Y_MIN, Y_MAX, 0, 900);
-+            yaw_angle   = (int16_t)map(effective_joy_x, X_MIN, X_MAX, 1280, -1280);
-+            pitch_angle = (int16_t)map(effective_joy_y, Y_MIN, Y_MAX, 0, 900);
++            if (running_screen != NULL && lv_obj_is_valid(running_screen)) {
++                update_running_screen(effective_joy_x, effective_joy_y, yaw_angle, pitch_angle,
++                                      joystick_data->channel, joystick_data->id, joystick_data->bat);
++            }
  
              // send pitch_angle and yaw_angle only when changes exceed threshold
              if (abs(yaw_angle - last_yaw) < 5 && abs(pitch_angle - last_pitch) < 5) {
-@@ -276,4 +347,39 @@ void handle_imu_screen(void *pvParam)
+-                if (pkt[7] != joystick_data->btnB_status) {
+-                    pkt[7] = joystick_data->btnB_status;
++                if (last_btnB_status != joystick_data->btnB_status) {
+                     espnow_send_data(pkt, sizeof(pkt));
++                    last_btnB_status = joystick_data->btnB_status;
+                 }
+-                vTaskDelay(30 / portTICK_PERIOD_MS);
++                vTaskDelay(RUNNING_LOOP_DELAY_MS / portTICK_PERIOD_MS);
+                 continue;
+             }
+ 
+-            pkt[0] = joystick_data->id;
+-            memcpy(&pkt[1], &yaw_angle, sizeof(int16_t));
+-            memcpy(&pkt[3], &pitch_angle, sizeof(int16_t));
+-            memcpy(&pkt[5], &speed_val, sizeof(int16_t));
+-            pkt[7] = joystick_data->btnB_status;
+-
+ #if 0 
+             ESP_LOGI("handle_running_screen", "Yaw: %d, Pitch: %d, Speed: %d, id: %u, Button: %u", 
+                         yaw_angle, pitch_angle, speed_val, joystick_data->id, joystick_data->btnB_status);
+@@ -192,8 +310,9 @@ void handle_running_screen(void *pvParam)
+ 
+             last_yaw   = yaw_angle;
+             last_pitch = pitch_angle;
++            last_btnB_status = joystick_data->btnB_status;
+             espnow_send_data(pkt, sizeof(pkt));
+-            vTaskDelay(30 / portTICK_PERIOD_MS);
++            vTaskDelay(RUNNING_LOOP_DELAY_MS / portTICK_PERIOD_MS);
+         } else {
+             vTaskDelay(200 / portTICK_PERIOD_MS);
+         }
+@@ -253,7 +372,7 @@ void handle_imu_screen(void *pvParam)
+             pitch_angle = (int16_t)map(limited_pitch, 0, 1.5, 900, 0);
+ 
+             if (abs(yaw_angle - last_yaw) < 10 && abs(last_pitch - pitch_angle) < 10) {
+-                vTaskDelay(30 / portTICK_PERIOD_MS);
++                vTaskDelay(RUNNING_LOOP_DELAY_MS / portTICK_PERIOD_MS);
+                 continue;
+             }
+             last_yaw   = yaw_angle;
+@@ -271,9 +390,44 @@ void handle_imu_screen(void *pvParam)
+                                             imu_angle.roll, imu_angle.pitch, yaw_angle, pitch_angle);
+ #endif
+ 
+-            vTaskDelay(30 / portTICK_PERIOD_MS);
++            vTaskDelay(RUNNING_LOOP_DELAY_MS / portTICK_PERIOD_MS);
+         } else {
              vTaskDelay(200 / portTICK_PERIOD_MS);
          }
      }
@@ -748,27 +1126,145 @@ index 0000000..1689b69
 +
 +#endif
 diff --git a/remote/code/main/ui/ui_running_screen.c b/remote/code/main/ui/ui_running_screen.c
-index deaff59..358f0b0 100644
+index deaff59..f90ea8d 100644
 --- a/remote/code/main/ui/ui_running_screen.c
 +++ b/remote/code/main/ui/ui_running_screen.c
-@@ -124,7 +124,7 @@ void create_running_screen()
+@@ -9,6 +9,7 @@ lv_obj_t* joystick_area      = NULL;
+ lv_obj_t* battery_label      = NULL;
+ lv_obj_t* channel_info_label = NULL;
+ lv_obj_t* id_info_label      = NULL;
++lv_obj_t* send_info_label    = NULL;
+ 
+ /**
+  * @brief Create the running screen UI with joystick visualization and status information
+@@ -55,8 +56,8 @@ void create_running_screen()
+ 
+     // Create joystick area
+     joystick_area = lv_obj_create(running_screen);
+-    lv_obj_set_size(joystick_area, 115, 115);  // Reduced size
+-    lv_obj_align(joystick_area, LV_ALIGN_TOP_MID, 0, 35);
++    lv_obj_set_size(joystick_area, 100, 100);
++    lv_obj_align(joystick_area, LV_ALIGN_TOP_MID, 0, 32);
+ 
+     // Set joystick area style
+     lv_obj_set_style_border_width(joystick_area, 2, LV_PART_MAIN);
+@@ -67,14 +68,14 @@ void create_running_screen()
+ 
+     // Add horizontal crosshair line
+     lv_obj_t* cross_line_h        = lv_line_create(joystick_area);
+-    static lv_point_t points_h[2] = {{0, 57}, {115, 57}};  // Horizontal center line
++    static lv_point_t points_h[2] = {{0, 50}, {100, 50}};  // Horizontal center line
+     lv_line_set_points(cross_line_h, points_h, 2);
+     lv_obj_set_style_line_color(cross_line_h, lv_color_make(64, 64, 64), 0);
+     lv_obj_set_style_line_width(cross_line_h, 1, 0);
+ 
+     // Add vertical crosshair line
+     lv_obj_t* cross_line_v        = lv_line_create(joystick_area);
+-    static lv_point_t points_v[2] = {{56, 0}, {56, 115}};  // Vertical center line
++    static lv_point_t points_v[2] = {{50, 0}, {50, 100}};  // Vertical center line
+     lv_line_set_points(cross_line_v, points_v, 2);
+     lv_obj_set_style_line_color(cross_line_v, lv_color_make(64, 64, 64), 0);
+     lv_obj_set_style_line_width(cross_line_v, 1, 0);
+@@ -87,22 +88,28 @@ void create_running_screen()
+     lv_obj_set_style_border_width(joystick_dot, 0, LV_PART_MAIN);
+     lv_obj_align(joystick_dot, LV_ALIGN_CENTER, 0, 0);
+ 
++    // Create send value display
++    send_info_label = lv_label_create(running_screen);
++    lv_label_set_text(send_info_label, "y:0 p:0");
++    lv_obj_align(send_info_label, LV_ALIGN_TOP_LEFT, 6, 138);
++    lv_obj_set_style_text_font(send_info_label, &lv_font_montserrat_14, 0);
++
+     // Create battery level display
+     battery_label = lv_label_create(running_screen);
+-    lv_label_set_text(battery_label, "Bat: 100%%");
+-    lv_obj_align(battery_label, LV_ALIGN_TOP_LEFT, 10, 160);
++    lv_label_set_text(battery_label, "Bat:100%% Ch:1");
++    lv_obj_align(battery_label, LV_ALIGN_TOP_LEFT, 6, 158);
+     lv_obj_set_style_text_font(battery_label, &lv_font_montserrat_14, 0);
+ 
+     // Create Channel information display
+     channel_info_label = lv_label_create(running_screen);
+-    lv_label_set_text(channel_info_label, "Channel: 1");
+-    lv_obj_align(channel_info_label, LV_ALIGN_TOP_LEFT, 10, 180);
++    lv_label_set_text(channel_info_label, "");
++    lv_obj_align(channel_info_label, LV_ALIGN_TOP_LEFT, 6, 178);
+     lv_obj_set_style_text_font(channel_info_label, &lv_font_montserrat_14, 0);
+ 
+     // Create ID information display
+     id_info_label = lv_label_create(running_screen);
+-    lv_label_set_text(id_info_label, "Receiver ID: \n0(broadcast)");
+-    lv_obj_align(id_info_label, LV_ALIGN_TOP_LEFT, 10, 200);
++    lv_label_set_text(id_info_label, "ID:0 broadcast");
++    lv_obj_align(id_info_label, LV_ALIGN_TOP_LEFT, 6, 178);
+     lv_obj_set_style_text_font(id_info_label, &lv_font_montserrat_14, 0);
+ 
+     lvgl_port_unlock();
+@@ -124,15 +131,16 @@ void create_running_screen()
   *      4. Updates the position of the joystick dot
   *      5. Updates battery level, channel and ID information labels
   */
 -void update_running_screen(int16_t joyX, int16_t joyY, uint8_t channel, uint8_t id, uint8_t bat)
-+void update_running_screen(uint16_t joyX, uint16_t joyY, uint8_t channel, uint8_t id, uint8_t bat)
++void update_running_screen(uint16_t joyX, uint16_t joyY, int16_t yaw, int16_t pitch, uint8_t channel, uint8_t id,
++                           uint8_t bat)
  {
      // Map joystick values to 115x115 area (using your mapping approach)
-     int16_t x_pos = map(joyX, X_MIN, X_MAX, 5, 110);  // Leave 5px margin
-@@ -185,4 +185,4 @@ void ui_running_screen_destory()
+-    int16_t x_pos = map(joyX, X_MIN, X_MAX, 5, 110);  // Leave 5px margin
+-    int16_t y_pos = map(joyY, Y_MIN, Y_MAX, 110, 5);  // Y-axis inverted
++    int16_t x_pos = map(joyX, X_MIN, X_MAX, 5, 95);  // Leave 5px margin
++    int16_t y_pos = map(joyY, Y_MIN, Y_MAX, 95, 5);  // Y-axis inverted
+ 
+     // Apply deadzone
+-    int16_t x_center = map(X_CENTER, X_MIN, X_MAX, 5, 110);
+-    int16_t y_center = map(Y_CENTER, Y_MIN, Y_MAX, 110, 5);
++    int16_t x_center = map(X_CENTER, X_MIN, X_MAX, 5, 95);
++    int16_t y_center = map(Y_CENTER, Y_MIN, Y_MAX, 95, 5);
+ 
+     if (abs(joyX - X_CENTER) < DEAD_ZONE) {
+         x_pos = x_center;
+@@ -142,8 +150,8 @@ void update_running_screen(int16_t joyX, int16_t joyY, uint8_t channel, uint8_t
+     }
+ 
+     // Limit range
+-    x_pos = fmax(5, fmin(x_pos, 110));
+-    y_pos = fmax(5, fmin(y_pos, 110));
++    x_pos = fmax(5, fmin(x_pos, 95));
++    y_pos = fmax(5, fmin(y_pos, 95));
+ 
+     while (!lvgl_port_lock()) {
+         vTaskDelay(pdMS_TO_TICKS(10));
+@@ -152,14 +160,16 @@ void update_running_screen(int16_t joyX, int16_t joyY, uint8_t channel, uint8_t
+     lv_obj_align(joystick_dot, LV_ALIGN_TOP_LEFT, x_pos - 5, y_pos - 5);
+ 
+     // Update battery level
+-    lv_label_set_text_fmt(battery_label, "Bat: %d%%", bat);
++    lv_label_set_text_fmt(battery_label, "Bat:%d%% Ch:%u", bat, channel);
++
++    // Update actual values sent in ESP-NOW packet
++    lv_label_set_text_fmt(send_info_label, "y:%d p:%d", yaw, pitch);
+ 
+-    // Update Channel and ID display
+-    lv_label_set_text_fmt(channel_info_label, "Channel: %u", channel);
++    lv_label_set_text(channel_info_label, "");
+     if (id == 0) {
+-        lv_label_set_text(id_info_label, "Receiver ID:\n  0(broadcast)");
++        lv_label_set_text(id_info_label, "ID:0 broadcast");
+     } else {
+-        lv_label_set_text_fmt(id_info_label, "Receiver ID: %u", id);
++        lv_label_set_text_fmt(id_info_label, "ID:%u", id);
+     }
+     lvgl_port_unlock();
+ }
+@@ -185,4 +195,5 @@ void ui_running_screen_destory()
      battery_label      = NULL;
      channel_info_label = NULL;
      id_info_label      = NULL;
 -}
 \ No newline at end of file
++    send_info_label    = NULL;
 +}
 diff --git a/remote/code/main/ui/ui_running_screen.h b/remote/code/main/ui/ui_running_screen.h
-index 6921a89..b975e4e 100644
+index 6921a89..c0aee6c 100644
 --- a/remote/code/main/ui/ui_running_screen.h
 +++ b/remote/code/main/ui/ui_running_screen.h
 @@ -14,13 +14,13 @@ extern "C" {
@@ -792,12 +1288,16 @@ index 6921a89..b975e4e 100644
  
  extern lv_obj_t* running_screen;
  extern lv_obj_t* joystick_dot;
-@@ -30,7 +30,7 @@ extern lv_obj_t* channel_info_label;
+@@ -28,9 +28,11 @@ extern lv_obj_t* joystick_area;
+ extern lv_obj_t* battery_label;
+ extern lv_obj_t* channel_info_label;
  extern lv_obj_t* id_info_label;
++extern lv_obj_t* send_info_label;
  
  void create_running_screen();
 -void update_running_screen(int16_t joyX, int16_t joyY, uint8_t channel, uint8_t id, uint8_t bat);
-+void update_running_screen(uint16_t joyX, uint16_t joyY, uint8_t channel, uint8_t id, uint8_t bat);
++void update_running_screen(uint16_t joyX, uint16_t joyY, int16_t yaw, int16_t pitch, uint8_t channel, uint8_t id,
++                           uint8_t bat);
  void ui_running_screen_destory();
  
  #ifdef __cplusplus
@@ -2449,152 +2949,1498 @@ index 0000000..30127eb
 +CONFIG_PARTITION_TABLE_CUSTOM=y
 +CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_sticks3.csv"
 +CONFIG_PARTITION_TABLE_FILENAME="partitions_sticks3.csv"
-diff --git a/remote/code/main/StackChan-RemoteControl-ESPNow.cpp b/remote/code/main/StackChan-RemoteControl-ESPNow.cpp
-index b9bb95f..54864da 100644
---- a/remote/code/main/StackChan-RemoteControl-ESPNow.cpp
-+++ b/remote/code/main/StackChan-RemoteControl-ESPNow.cpp
-@@ -19,6 +19,78 @@ using namespace m5;
+diff --git a/remote/code/sdkconfig.old b/remote/code/sdkconfig.old
+index 2cc0fcd..48c1b54 100644
+--- a/remote/code/sdkconfig.old
++++ b/remote/code/sdkconfig.old
+@@ -1,45 +1,62 @@
+ #
+ # Automatically generated file. DO NOT EDIT.
+-# Espressif IoT Development Framework (ESP-IDF) 5.4.2 Project Configuration
++# Espressif IoT Development Framework (ESP-IDF) 5.4.4 Project Configuration
+ #
+-CONFIG_SOC_BROWNOUT_RESET_SUPPORTED="Not determined"
+-CONFIG_SOC_TWAI_BRP_DIV_SUPPORTED="Not determined"
+-CONFIG_SOC_DPORT_WORKAROUND="Not determined"
+-CONFIG_SOC_CAPS_ECO_VER_MAX=301
++CONFIG_SOC_MPU_MIN_REGION_SIZE=0x20000000
++CONFIG_SOC_MPU_REGIONS_MAX_NUM=8
+ CONFIG_SOC_ADC_SUPPORTED=y
+-CONFIG_SOC_DAC_SUPPORTED=y
+ CONFIG_SOC_UART_SUPPORTED=y
+-CONFIG_SOC_MCPWM_SUPPORTED=y
+-CONFIG_SOC_GPTIMER_SUPPORTED=y
+-CONFIG_SOC_SDMMC_HOST_SUPPORTED=y
+-CONFIG_SOC_BT_SUPPORTED=y
+ CONFIG_SOC_PCNT_SUPPORTED=y
+ CONFIG_SOC_PHY_SUPPORTED=y
+ CONFIG_SOC_WIFI_SUPPORTED=y
+-CONFIG_SOC_SDIO_SLAVE_SUPPORTED=y
+ CONFIG_SOC_TWAI_SUPPORTED=y
+-CONFIG_SOC_EFUSE_SUPPORTED=y
+-CONFIG_SOC_EMAC_SUPPORTED=y
++CONFIG_SOC_GDMA_SUPPORTED=y
++CONFIG_SOC_UHCI_SUPPORTED=y
++CONFIG_SOC_AHB_GDMA_SUPPORTED=y
++CONFIG_SOC_GPTIMER_SUPPORTED=y
++CONFIG_SOC_LCDCAM_SUPPORTED=y
++CONFIG_SOC_LCDCAM_CAM_SUPPORTED=y
++CONFIG_SOC_LCDCAM_I80_LCD_SUPPORTED=y
++CONFIG_SOC_LCDCAM_RGB_LCD_SUPPORTED=y
++CONFIG_SOC_MCPWM_SUPPORTED=y
++CONFIG_SOC_DEDICATED_GPIO_SUPPORTED=y
++CONFIG_SOC_CACHE_SUPPORT_WRAP=y
+ CONFIG_SOC_ULP_SUPPORTED=y
++CONFIG_SOC_ULP_FSM_SUPPORTED=y
++CONFIG_SOC_RISCV_COPROC_SUPPORTED=y
++CONFIG_SOC_BT_SUPPORTED=y
++CONFIG_SOC_USB_OTG_SUPPORTED=y
++CONFIG_SOC_USB_SERIAL_JTAG_SUPPORTED=y
+ CONFIG_SOC_CCOMP_TIMER_SUPPORTED=y
++CONFIG_SOC_ASYNC_MEMCPY_SUPPORTED=y
++CONFIG_SOC_SUPPORTS_SECURE_DL_MODE=y
++CONFIG_SOC_EFUSE_KEY_PURPOSE_FIELD=y
++CONFIG_SOC_EFUSE_SUPPORTED=y
++CONFIG_SOC_SDMMC_HOST_SUPPORTED=y
+ CONFIG_SOC_RTC_FAST_MEM_SUPPORTED=y
+ CONFIG_SOC_RTC_SLOW_MEM_SUPPORTED=y
+ CONFIG_SOC_RTC_MEM_SUPPORTED=y
++CONFIG_SOC_PSRAM_DMA_CAPABLE=y
++CONFIG_SOC_XT_WDT_SUPPORTED=y
+ CONFIG_SOC_I2S_SUPPORTED=y
+ CONFIG_SOC_RMT_SUPPORTED=y
+ CONFIG_SOC_SDM_SUPPORTED=y
+ CONFIG_SOC_GPSPI_SUPPORTED=y
+ CONFIG_SOC_LEDC_SUPPORTED=y
+ CONFIG_SOC_I2C_SUPPORTED=y
++CONFIG_SOC_SYSTIMER_SUPPORTED=y
+ CONFIG_SOC_SUPPORT_COEXISTENCE=y
++CONFIG_SOC_TEMP_SENSOR_SUPPORTED=y
+ CONFIG_SOC_AES_SUPPORTED=y
+ CONFIG_SOC_MPI_SUPPORTED=y
+ CONFIG_SOC_SHA_SUPPORTED=y
++CONFIG_SOC_HMAC_SUPPORTED=y
++CONFIG_SOC_DIG_SIGN_SUPPORTED=y
+ CONFIG_SOC_FLASH_ENC_SUPPORTED=y
+ CONFIG_SOC_SECURE_BOOT_SUPPORTED=y
++CONFIG_SOC_MEMPROT_SUPPORTED=y
+ CONFIG_SOC_TOUCH_SENSOR_SUPPORTED=y
+ CONFIG_SOC_BOD_SUPPORTED=y
+-CONFIG_SOC_ULP_FSM_SUPPORTED=y
+ CONFIG_SOC_CLK_TREE_SUPPORTED=y
+ CONFIG_SOC_MPU_SUPPORTED=y
+ CONFIG_SOC_WDT_SUPPORTED=y
+@@ -49,83 +66,97 @@ CONFIG_SOC_LIGHT_SLEEP_SUPPORTED=y
+ CONFIG_SOC_DEEP_SLEEP_SUPPORTED=y
+ CONFIG_SOC_LP_PERIPH_SHARE_INTERRUPT=y
+ CONFIG_SOC_PM_SUPPORTED=y
+-CONFIG_SOC_DPORT_WORKAROUND_DIS_INTERRUPT_LVL=5
+-CONFIG_SOC_XTAL_SUPPORT_26M=y
++CONFIG_SOC_SIMD_INSTRUCTION_SUPPORTED=y
+ CONFIG_SOC_XTAL_SUPPORT_40M=y
+-CONFIG_SOC_XTAL_SUPPORT_AUTO_DETECT=y
++CONFIG_SOC_APPCPU_HAS_CLOCK_GATING_BUG=y
+ CONFIG_SOC_ADC_RTC_CTRL_SUPPORTED=y
+ CONFIG_SOC_ADC_DIG_CTRL_SUPPORTED=y
++CONFIG_SOC_ADC_ARBITER_SUPPORTED=y
++CONFIG_SOC_ADC_DIG_IIR_FILTER_SUPPORTED=y
++CONFIG_SOC_ADC_MONITOR_SUPPORTED=y
+ CONFIG_SOC_ADC_DMA_SUPPORTED=y
+ CONFIG_SOC_ADC_PERIPH_NUM=2
+ CONFIG_SOC_ADC_MAX_CHANNEL_NUM=10
+ CONFIG_SOC_ADC_ATTEN_NUM=4
+ CONFIG_SOC_ADC_DIGI_CONTROLLER_NUM=2
+-CONFIG_SOC_ADC_PATT_LEN_MAX=16
+-CONFIG_SOC_ADC_DIGI_MIN_BITWIDTH=9
++CONFIG_SOC_ADC_PATT_LEN_MAX=24
++CONFIG_SOC_ADC_DIGI_MIN_BITWIDTH=12
+ CONFIG_SOC_ADC_DIGI_MAX_BITWIDTH=12
+-CONFIG_SOC_ADC_DIGI_RESULT_BYTES=2
++CONFIG_SOC_ADC_DIGI_RESULT_BYTES=4
+ CONFIG_SOC_ADC_DIGI_DATA_BYTES_PER_CONV=4
+-CONFIG_SOC_ADC_DIGI_MONITOR_NUM=0
+-CONFIG_SOC_ADC_SAMPLE_FREQ_THRES_HIGH=2
+-CONFIG_SOC_ADC_SAMPLE_FREQ_THRES_LOW=20
+-CONFIG_SOC_ADC_RTC_MIN_BITWIDTH=9
++CONFIG_SOC_ADC_DIGI_IIR_FILTER_NUM=2
++CONFIG_SOC_ADC_DIGI_MONITOR_NUM=2
++CONFIG_SOC_ADC_SAMPLE_FREQ_THRES_HIGH=83333
++CONFIG_SOC_ADC_SAMPLE_FREQ_THRES_LOW=611
++CONFIG_SOC_ADC_RTC_MIN_BITWIDTH=12
+ CONFIG_SOC_ADC_RTC_MAX_BITWIDTH=12
++CONFIG_SOC_ADC_CALIBRATION_V1_SUPPORTED=y
++CONFIG_SOC_ADC_SELF_HW_CALI_SUPPORTED=y
+ CONFIG_SOC_ADC_SHARED_POWER=y
+-CONFIG_SOC_SHARED_IDCACHE_SUPPORTED=y
+-CONFIG_SOC_IDCACHE_PER_CORE=y
++CONFIG_SOC_APB_BACKUP_DMA=y
++CONFIG_SOC_BROWNOUT_RESET_SUPPORTED=y
++CONFIG_SOC_CACHE_WRITEBACK_SUPPORTED=y
++CONFIG_SOC_CACHE_FREEZE_SUPPORTED=y
+ CONFIG_SOC_CPU_CORES_NUM=2
+ CONFIG_SOC_CPU_INTR_NUM=32
+ CONFIG_SOC_CPU_HAS_FPU=y
+ CONFIG_SOC_HP_CPU_HAS_MULTIPLE_CORES=y
+ CONFIG_SOC_CPU_BREAKPOINTS_NUM=2
+ CONFIG_SOC_CPU_WATCHPOINTS_NUM=2
+-CONFIG_SOC_CPU_WATCHPOINT_MAX_REGION_SIZE=64
+-CONFIG_SOC_DAC_CHAN_NUM=2
+-CONFIG_SOC_DAC_RESOLUTION=8
+-CONFIG_SOC_DAC_DMA_16BIT_ALIGN=y
++CONFIG_SOC_CPU_WATCHPOINT_MAX_REGION_SIZE=0x40
++CONFIG_SOC_SIMD_PREFERRED_DATA_ALIGNMENT=16
++CONFIG_SOC_DS_SIGNATURE_MAX_BIT_LEN=4096
++CONFIG_SOC_DS_KEY_PARAM_MD_IV_LENGTH=16
++CONFIG_SOC_DS_KEY_CHECK_MAX_WAIT_US=1100
++CONFIG_SOC_AHB_GDMA_VERSION=1
++CONFIG_SOC_GDMA_NUM_GROUPS_MAX=1
++CONFIG_SOC_GDMA_PAIRS_PER_GROUP=5
++CONFIG_SOC_GDMA_PAIRS_PER_GROUP_MAX=5
++CONFIG_SOC_AHB_GDMA_SUPPORT_PSRAM=y
+ CONFIG_SOC_GPIO_PORT=1
+-CONFIG_SOC_GPIO_PIN_COUNT=40
+-CONFIG_SOC_GPIO_VALID_GPIO_MASK=0xFFFFFFFFFF
+-CONFIG_SOC_GPIO_IN_RANGE_MAX=39
+-CONFIG_SOC_GPIO_OUT_RANGE_MAX=33
+-CONFIG_SOC_GPIO_VALID_DIGITAL_IO_PAD_MASK=0xEF0FEA
++CONFIG_SOC_GPIO_PIN_COUNT=49
++CONFIG_SOC_GPIO_SUPPORT_PIN_GLITCH_FILTER=y
++CONFIG_SOC_GPIO_FILTER_CLK_SUPPORT_APB=y
++CONFIG_SOC_GPIO_SUPPORT_RTC_INDEPENDENT=y
++CONFIG_SOC_GPIO_SUPPORT_FORCE_HOLD=y
++CONFIG_SOC_GPIO_VALID_GPIO_MASK=0x1FFFFFFFFFFFF
++CONFIG_SOC_GPIO_IN_RANGE_MAX=48
++CONFIG_SOC_GPIO_OUT_RANGE_MAX=48
++CONFIG_SOC_GPIO_VALID_DIGITAL_IO_PAD_MASK=0x0001FFFFFC000000
+ CONFIG_SOC_GPIO_CLOCKOUT_BY_IO_MUX=y
+ CONFIG_SOC_GPIO_CLOCKOUT_CHANNEL_NUM=3
+-CONFIG_SOC_GPIO_SUPPORT_HOLD_IO_IN_DSLP=y
++CONFIG_SOC_DEDIC_GPIO_OUT_CHANNELS_NUM=8
++CONFIG_SOC_DEDIC_GPIO_IN_CHANNELS_NUM=8
++CONFIG_SOC_DEDIC_GPIO_OUT_AUTO_ENABLE=y
+ CONFIG_SOC_I2C_NUM=2
+ CONFIG_SOC_HP_I2C_NUM=2
+ CONFIG_SOC_I2C_FIFO_LEN=32
+-CONFIG_SOC_I2C_CMD_REG_NUM=16
++CONFIG_SOC_I2C_CMD_REG_NUM=8
+ CONFIG_SOC_I2C_SUPPORT_SLAVE=y
+-CONFIG_SOC_I2C_SUPPORT_APB=y
++CONFIG_SOC_I2C_SUPPORT_HW_CLR_BUS=y
++CONFIG_SOC_I2C_SUPPORT_XTAL=y
++CONFIG_SOC_I2C_SUPPORT_RTC=y
+ CONFIG_SOC_I2C_SUPPORT_10BIT_ADDR=y
+-CONFIG_SOC_I2C_STOP_INDEPENDENT=y
++CONFIG_SOC_I2C_SLAVE_SUPPORT_BROADCAST=y
++CONFIG_SOC_I2C_SLAVE_SUPPORT_I2CRAM_ACCESS=y
++CONFIG_SOC_I2C_SLAVE_CAN_GET_STRETCH_CAUSE=y
+ CONFIG_SOC_I2S_NUM=2
+-CONFIG_SOC_I2S_HW_VERSION_1=y
+-CONFIG_SOC_I2S_SUPPORTS_APLL=y
++CONFIG_SOC_I2S_HW_VERSION_2=y
++CONFIG_SOC_I2S_SUPPORTS_XTAL=y
+ CONFIG_SOC_I2S_SUPPORTS_PLL_F160M=y
++CONFIG_SOC_I2S_SUPPORTS_PCM=y
+ CONFIG_SOC_I2S_SUPPORTS_PDM=y
+ CONFIG_SOC_I2S_SUPPORTS_PDM_TX=y
+-CONFIG_SOC_I2S_PDM_MAX_TX_LINES=1
++CONFIG_SOC_I2S_PDM_MAX_TX_LINES=2
+ CONFIG_SOC_I2S_SUPPORTS_PDM_RX=y
+-CONFIG_SOC_I2S_PDM_MAX_RX_LINES=1
+-CONFIG_SOC_I2S_SUPPORTS_ADC_DAC=y
+-CONFIG_SOC_I2S_SUPPORTS_ADC=y
+-CONFIG_SOC_I2S_SUPPORTS_DAC=y
+-CONFIG_SOC_I2S_SUPPORTS_LCD_CAMERA=y
+-CONFIG_SOC_I2S_MAX_DATA_WIDTH=24
+-CONFIG_SOC_I2S_TRANS_SIZE_ALIGN_WORD=y
+-CONFIG_SOC_I2S_LCD_I80_VARIANT=y
+-CONFIG_SOC_LCD_I80_SUPPORTED=y
+-CONFIG_SOC_LCD_I80_BUSES=2
+-CONFIG_SOC_LCD_I80_BUS_WIDTH=24
+-CONFIG_SOC_LEDC_HAS_TIMER_SPECIFIC_MUX=y
++CONFIG_SOC_I2S_PDM_MAX_RX_LINES=4
++CONFIG_SOC_I2S_SUPPORTS_TDM=y
+ CONFIG_SOC_LEDC_SUPPORT_APB_CLOCK=y
+-CONFIG_SOC_LEDC_SUPPORT_REF_TICK=y
+-CONFIG_SOC_LEDC_SUPPORT_HS_MODE=y
++CONFIG_SOC_LEDC_SUPPORT_XTAL_CLOCK=y
+ CONFIG_SOC_LEDC_TIMER_NUM=4
+ CONFIG_SOC_LEDC_CHANNEL_NUM=8
+-CONFIG_SOC_LEDC_TIMER_BIT_WIDTH=20
++CONFIG_SOC_LEDC_TIMER_BIT_WIDTH=14
++CONFIG_SOC_LEDC_SUPPORT_FADE_STOP=y
+ CONFIG_SOC_MCPWM_GROUPS=2
+ CONFIG_SOC_MCPWM_TIMERS_PER_GROUP=3
+ CONFIG_SOC_MCPWM_OPERATORS_PER_GROUP=3
+@@ -136,120 +167,224 @@ CONFIG_SOC_MCPWM_GPIO_FAULTS_PER_GROUP=3
+ CONFIG_SOC_MCPWM_CAPTURE_TIMERS_PER_GROUP=y
+ CONFIG_SOC_MCPWM_CAPTURE_CHANNELS_PER_TIMER=3
+ CONFIG_SOC_MCPWM_GPIO_SYNCHROS_PER_GROUP=3
+-CONFIG_SOC_MMU_PERIPH_NUM=2
+-CONFIG_SOC_MMU_LINEAR_ADDRESS_REGION_NUM=3
+-CONFIG_SOC_MPU_MIN_REGION_SIZE=0x20000000
+-CONFIG_SOC_MPU_REGIONS_MAX_NUM=8
++CONFIG_SOC_MCPWM_SWSYNC_CAN_PROPAGATE=y
++CONFIG_SOC_MMU_LINEAR_ADDRESS_REGION_NUM=1
++CONFIG_SOC_MMU_PERIPH_NUM=1
+ CONFIG_SOC_PCNT_GROUPS=1
+-CONFIG_SOC_PCNT_UNITS_PER_GROUP=8
++CONFIG_SOC_PCNT_UNITS_PER_GROUP=4
+ CONFIG_SOC_PCNT_CHANNELS_PER_UNIT=2
+ CONFIG_SOC_PCNT_THRES_POINT_PER_UNIT=2
+ CONFIG_SOC_RMT_GROUPS=1
+-CONFIG_SOC_RMT_TX_CANDIDATES_PER_GROUP=8
+-CONFIG_SOC_RMT_RX_CANDIDATES_PER_GROUP=8
++CONFIG_SOC_RMT_TX_CANDIDATES_PER_GROUP=4
++CONFIG_SOC_RMT_RX_CANDIDATES_PER_GROUP=4
+ CONFIG_SOC_RMT_CHANNELS_PER_GROUP=8
+-CONFIG_SOC_RMT_MEM_WORDS_PER_CHANNEL=64
+-CONFIG_SOC_RMT_SUPPORT_REF_TICK=y
++CONFIG_SOC_RMT_MEM_WORDS_PER_CHANNEL=48
++CONFIG_SOC_RMT_SUPPORT_RX_PINGPONG=y
++CONFIG_SOC_RMT_SUPPORT_RX_DEMODULATION=y
++CONFIG_SOC_RMT_SUPPORT_ASYNC_STOP=y
++CONFIG_SOC_RMT_SUPPORT_TX_LOOP_COUNT=y
++CONFIG_SOC_RMT_SUPPORT_TX_LOOP_AUTO_STOP=y
++CONFIG_SOC_RMT_SUPPORT_TX_SYNCHRO=y
++CONFIG_SOC_RMT_SUPPORT_TX_CARRIER_DATA_ONLY=y
++CONFIG_SOC_RMT_SUPPORT_XTAL=y
++CONFIG_SOC_RMT_SUPPORT_RC_FAST=y
+ CONFIG_SOC_RMT_SUPPORT_APB=y
+-CONFIG_SOC_RMT_CHANNEL_CLK_INDEPENDENT=y
+-CONFIG_SOC_RTCIO_PIN_COUNT=18
++CONFIG_SOC_RMT_SUPPORT_DMA=y
++CONFIG_SOC_LCD_I80_SUPPORTED=y
++CONFIG_SOC_LCD_RGB_SUPPORTED=y
++CONFIG_SOC_LCD_I80_BUSES=1
++CONFIG_SOC_LCD_RGB_PANELS=1
++CONFIG_SOC_LCD_I80_BUS_WIDTH=16
++CONFIG_SOC_LCD_RGB_DATA_WIDTH=16
++CONFIG_SOC_LCD_SUPPORT_RGB_YUV_CONV=y
++CONFIG_SOC_LCDCAM_I80_NUM_BUSES=1
++CONFIG_SOC_LCDCAM_I80_BUS_WIDTH=16
++CONFIG_SOC_LCDCAM_RGB_NUM_PANELS=1
++CONFIG_SOC_LCDCAM_RGB_DATA_WIDTH=16
++CONFIG_SOC_RTC_CNTL_CPU_PD_DMA_BUS_WIDTH=128
++CONFIG_SOC_RTC_CNTL_CPU_PD_REG_FILE_NUM=549
++CONFIG_SOC_RTC_CNTL_TAGMEM_PD_DMA_BUS_WIDTH=128
++CONFIG_SOC_RTC_CNTL_NEEDS_ATOMIC_ACCESS=y
++CONFIG_SOC_RTCIO_PIN_COUNT=22
+ CONFIG_SOC_RTCIO_INPUT_OUTPUT_SUPPORTED=y
+ CONFIG_SOC_RTCIO_HOLD_SUPPORTED=y
+ CONFIG_SOC_RTCIO_WAKE_SUPPORTED=y
++CONFIG_SOC_LP_IO_CLOCK_IS_INDEPENDENT=y
+ CONFIG_SOC_SDM_GROUPS=1
+ CONFIG_SOC_SDM_CHANNELS_PER_GROUP=8
+ CONFIG_SOC_SDM_CLK_SUPPORT_APB=y
+-CONFIG_SOC_SPI_HD_BOTH_INOUT_SUPPORTED=y
+-CONFIG_SOC_SPI_AS_CS_SUPPORTED=y
+ CONFIG_SOC_SPI_PERIPH_NUM=3
+-CONFIG_SOC_SPI_DMA_CHAN_NUM=2
+-CONFIG_SOC_SPI_MAX_CS_NUM=3
+-CONFIG_SOC_SPI_SUPPORT_CLK_APB=y
++CONFIG_SOC_SPI_MAX_CS_NUM=6
+ CONFIG_SOC_SPI_MAXIMUM_BUFFER_SIZE=64
+-CONFIG_SOC_SPI_MAX_PRE_DIVIDER=8192
++CONFIG_SOC_SPI_SUPPORT_DDRCLK=y
++CONFIG_SOC_SPI_SLAVE_SUPPORT_SEG_TRANS=y
++CONFIG_SOC_SPI_SUPPORT_CD_SIG=y
++CONFIG_SOC_SPI_SUPPORT_CONTINUOUS_TRANS=y
++CONFIG_SOC_SPI_SUPPORT_SLAVE_HD_VER2=y
++CONFIG_SOC_SPI_SUPPORT_CLK_APB=y
++CONFIG_SOC_SPI_SUPPORT_CLK_XTAL=y
++CONFIG_SOC_SPI_PERIPH_SUPPORT_CONTROL_DUMMY_OUT=y
++CONFIG_SOC_MEMSPI_IS_INDEPENDENT=y
++CONFIG_SOC_SPI_MAX_PRE_DIVIDER=16
++CONFIG_SOC_SPI_SUPPORT_OCT=y
++CONFIG_SOC_SPI_SCT_SUPPORTED=y
++CONFIG_SOC_SPI_SCT_REG_NUM=14
++CONFIG_SOC_SPI_SCT_BUFFER_NUM_MAX=y
++CONFIG_SOC_SPI_SCT_CONF_BITLEN_MAX=0x3FFFA
++CONFIG_SOC_MEMSPI_SRC_FREQ_120M=y
+ CONFIG_SOC_MEMSPI_SRC_FREQ_80M_SUPPORTED=y
+ CONFIG_SOC_MEMSPI_SRC_FREQ_40M_SUPPORTED=y
+-CONFIG_SOC_MEMSPI_SRC_FREQ_26M_SUPPORTED=y
+ CONFIG_SOC_MEMSPI_SRC_FREQ_20M_SUPPORTED=y
++CONFIG_SOC_SPIRAM_SUPPORTED=y
++CONFIG_SOC_SPIRAM_XIP_SUPPORTED=y
++CONFIG_SOC_SYSTIMER_COUNTER_NUM=2
++CONFIG_SOC_SYSTIMER_ALARM_NUM=3
++CONFIG_SOC_SYSTIMER_BIT_WIDTH_LO=32
++CONFIG_SOC_SYSTIMER_BIT_WIDTH_HI=20
++CONFIG_SOC_SYSTIMER_FIXED_DIVIDER=y
++CONFIG_SOC_SYSTIMER_INT_LEVEL=y
++CONFIG_SOC_SYSTIMER_ALARM_MISS_COMPENSATE=y
+ CONFIG_SOC_TIMER_GROUPS=2
+ CONFIG_SOC_TIMER_GROUP_TIMERS_PER_GROUP=2
+-CONFIG_SOC_TIMER_GROUP_COUNTER_BIT_WIDTH=64
+-CONFIG_SOC_TIMER_GROUP_TOTAL_TIMERS=4
++CONFIG_SOC_TIMER_GROUP_COUNTER_BIT_WIDTH=54
++CONFIG_SOC_TIMER_GROUP_SUPPORT_XTAL=y
+ CONFIG_SOC_TIMER_GROUP_SUPPORT_APB=y
++CONFIG_SOC_TIMER_GROUP_TOTAL_TIMERS=4
+ CONFIG_SOC_LP_TIMER_BIT_WIDTH_LO=32
+ CONFIG_SOC_LP_TIMER_BIT_WIDTH_HI=16
+-CONFIG_SOC_TOUCH_SENSOR_VERSION=1
+-CONFIG_SOC_TOUCH_SENSOR_NUM=10
++CONFIG_SOC_TOUCH_SENSOR_VERSION=2
++CONFIG_SOC_TOUCH_SENSOR_NUM=15
++CONFIG_SOC_TOUCH_SUPPORT_SLEEP_WAKEUP=y
++CONFIG_SOC_TOUCH_SUPPORT_WATERPROOF=y
++CONFIG_SOC_TOUCH_SUPPORT_PROX_SENSING=y
++CONFIG_SOC_TOUCH_PROXIMITY_CHANNEL_NUM=3
++CONFIG_SOC_TOUCH_PROXIMITY_MEAS_DONE_SUPPORTED=y
+ CONFIG_SOC_TOUCH_SAMPLE_CFG_NUM=1
+ CONFIG_SOC_TWAI_CONTROLLER_NUM=1
+-CONFIG_SOC_TWAI_BRP_MIN=2
+ CONFIG_SOC_TWAI_CLK_SUPPORT_APB=y
+-CONFIG_SOC_TWAI_SUPPORT_MULTI_ADDRESS_LAYOUT=y
++CONFIG_SOC_TWAI_BRP_MIN=2
++CONFIG_SOC_TWAI_BRP_MAX=16384
++CONFIG_SOC_TWAI_SUPPORTS_RX_STATUS=y
+ CONFIG_SOC_UART_NUM=3
+ CONFIG_SOC_UART_HP_NUM=3
+-CONFIG_SOC_UART_SUPPORT_APB_CLK=y
+-CONFIG_SOC_UART_SUPPORT_REF_TICK=y
+ CONFIG_SOC_UART_FIFO_LEN=128
+ CONFIG_SOC_UART_BITRATE_MAX=5000000
+-CONFIG_SOC_SPIRAM_SUPPORTED=y
+-CONFIG_SOC_SPI_MEM_SUPPORT_CONFIG_GPIO_BY_EFUSE=y
+-CONFIG_SOC_SHA_SUPPORT_PARALLEL_ENG=y
+-CONFIG_SOC_SHA_ENDIANNESS_BE=y
++CONFIG_SOC_UART_SUPPORT_FSM_TX_WAIT_SEND=y
++CONFIG_SOC_UART_SUPPORT_WAKEUP_INT=y
++CONFIG_SOC_UART_SUPPORT_APB_CLK=y
++CONFIG_SOC_UART_SUPPORT_RTC_CLK=y
++CONFIG_SOC_UART_SUPPORT_XTAL_CLK=y
++CONFIG_SOC_UHCI_NUM=1
++CONFIG_SOC_USB_OTG_PERIPH_NUM=1
++CONFIG_SOC_SHA_DMA_MAX_BUFFER_SIZE=3968
++CONFIG_SOC_SHA_SUPPORT_DMA=y
++CONFIG_SOC_SHA_SUPPORT_RESUME=y
++CONFIG_SOC_SHA_GDMA=y
+ CONFIG_SOC_SHA_SUPPORT_SHA1=y
++CONFIG_SOC_SHA_SUPPORT_SHA224=y
+ CONFIG_SOC_SHA_SUPPORT_SHA256=y
+ CONFIG_SOC_SHA_SUPPORT_SHA384=y
+ CONFIG_SOC_SHA_SUPPORT_SHA512=y
++CONFIG_SOC_SHA_SUPPORT_SHA512_224=y
++CONFIG_SOC_SHA_SUPPORT_SHA512_256=y
++CONFIG_SOC_SHA_SUPPORT_SHA512_T=y
+ CONFIG_SOC_MPI_MEM_BLOCKS_NUM=4
+-CONFIG_SOC_MPI_OPERATIONS_NUM=y
++CONFIG_SOC_MPI_OPERATIONS_NUM=3
+ CONFIG_SOC_RSA_MAX_BIT_LEN=4096
++CONFIG_SOC_AES_SUPPORT_DMA=y
++CONFIG_SOC_AES_GDMA=y
+ CONFIG_SOC_AES_SUPPORT_AES_128=y
+-CONFIG_SOC_AES_SUPPORT_AES_192=y
+ CONFIG_SOC_AES_SUPPORT_AES_256=y
+-CONFIG_SOC_SECURE_BOOT_V1=y
+-CONFIG_SOC_EFUSE_SECURE_BOOT_KEY_DIGESTS=y
+-CONFIG_SOC_FLASH_ENCRYPTED_XTS_AES_BLOCK_MAX=32
+-CONFIG_SOC_PHY_DIG_REGS_MEM_SIZE=21
+ CONFIG_SOC_PM_SUPPORT_EXT0_WAKEUP=y
+ CONFIG_SOC_PM_SUPPORT_EXT1_WAKEUP=y
+ CONFIG_SOC_PM_SUPPORT_EXT_WAKEUP=y
++CONFIG_SOC_PM_SUPPORT_WIFI_WAKEUP=y
++CONFIG_SOC_PM_SUPPORT_BT_WAKEUP=y
+ CONFIG_SOC_PM_SUPPORT_TOUCH_SENSOR_WAKEUP=y
++CONFIG_SOC_PM_SUPPORT_CPU_PD=y
++CONFIG_SOC_PM_SUPPORT_TAGMEM_PD=y
+ CONFIG_SOC_PM_SUPPORT_RTC_PERIPH_PD=y
+-CONFIG_SOC_PM_SUPPORT_RTC_FAST_MEM_PD=y
+-CONFIG_SOC_PM_SUPPORT_RTC_SLOW_MEM_PD=y
+ CONFIG_SOC_PM_SUPPORT_RC_FAST_PD=y
+ CONFIG_SOC_PM_SUPPORT_VDDSDIO_PD=y
++CONFIG_SOC_PM_SUPPORT_MAC_BB_PD=y
+ CONFIG_SOC_PM_SUPPORT_MODEM_PD=y
+ CONFIG_SOC_CONFIGURABLE_VDDSDIO_SUPPORTED=y
++CONFIG_SOC_PM_SUPPORT_DEEPSLEEP_CHECK_STUB_ONLY=y
++CONFIG_SOC_PM_CPU_RETENTION_BY_RTCCNTL=y
++CONFIG_SOC_PM_MODEM_RETENTION_BY_BACKUPDMA=y
+ CONFIG_SOC_PM_MODEM_PD_BY_SW=y
+-CONFIG_SOC_CLK_APLL_SUPPORTED=y
+ CONFIG_SOC_CLK_RC_FAST_D256_SUPPORTED=y
+ CONFIG_SOC_RTC_SLOW_CLK_SUPPORT_RC_FAST_D256=y
+ CONFIG_SOC_CLK_RC_FAST_SUPPORT_CALIBRATION=y
+ CONFIG_SOC_CLK_XTAL32K_SUPPORTED=y
+-CONFIG_SOC_SDMMC_USE_IOMUX=y
++CONFIG_SOC_EFUSE_DIS_DOWNLOAD_ICACHE=y
++CONFIG_SOC_EFUSE_DIS_DOWNLOAD_DCACHE=y
++CONFIG_SOC_EFUSE_HARD_DIS_JTAG=y
++CONFIG_SOC_EFUSE_DIS_USB_JTAG=y
++CONFIG_SOC_EFUSE_SOFT_DIS_JTAG=y
++CONFIG_SOC_EFUSE_DIS_DIRECT_BOOT=y
++CONFIG_SOC_EFUSE_DIS_ICACHE=y
++CONFIG_SOC_EFUSE_BLOCK9_KEY_PURPOSE_QUIRK=y
++CONFIG_SOC_SECURE_BOOT_V2_RSA=y
++CONFIG_SOC_EFUSE_SECURE_BOOT_KEY_DIGESTS=3
++CONFIG_SOC_EFUSE_REVOKE_BOOT_KEY_DIGESTS=y
++CONFIG_SOC_SUPPORT_SECURE_BOOT_REVOKE_KEY=y
++CONFIG_SOC_FLASH_ENCRYPTED_XTS_AES_BLOCK_MAX=64
++CONFIG_SOC_FLASH_ENCRYPTION_XTS_AES=y
++CONFIG_SOC_FLASH_ENCRYPTION_XTS_AES_OPTIONS=y
++CONFIG_SOC_FLASH_ENCRYPTION_XTS_AES_128=y
++CONFIG_SOC_FLASH_ENCRYPTION_XTS_AES_256=y
++CONFIG_SOC_MEMPROT_CPU_PREFETCH_PAD_SIZE=16
++CONFIG_SOC_MEMPROT_MEM_ALIGN_SIZE=256
++CONFIG_SOC_PHY_DIG_REGS_MEM_SIZE=21
++CONFIG_SOC_MAC_BB_PD_MEM_SIZE=192
++CONFIG_SOC_WIFI_LIGHT_SLEEP_CLK_WIDTH=12
++CONFIG_SOC_SPI_MEM_SUPPORT_AUTO_WAIT_IDLE=y
++CONFIG_SOC_SPI_MEM_SUPPORT_AUTO_SUSPEND=y
++CONFIG_SOC_SPI_MEM_SUPPORT_AUTO_RESUME=y
++CONFIG_SOC_SPI_MEM_SUPPORT_SW_SUSPEND=y
++CONFIG_SOC_SPI_MEM_SUPPORT_OPI_MODE=y
++CONFIG_SOC_SPI_MEM_SUPPORT_TIMING_TUNING=y
++CONFIG_SOC_SPI_MEM_SUPPORT_CONFIG_GPIO_BY_EFUSE=y
++CONFIG_SOC_SPI_MEM_SUPPORT_WRAP=y
++CONFIG_SOC_MEMSPI_TIMING_TUNING_BY_MSPI_DELAY=y
++CONFIG_SOC_MEMSPI_CORE_CLK_SHARED_WITH_PSRAM=y
++CONFIG_SOC_SPI_MEM_SUPPORT_CACHE_32BIT_ADDR_MAP=y
++CONFIG_SOC_COEX_HW_PTI=y
++CONFIG_SOC_EXTERNAL_COEX_LEADER_TX_LINE=y
++CONFIG_SOC_SDMMC_USE_GPIO_MATRIX=y
+ CONFIG_SOC_SDMMC_NUM_SLOTS=2
++CONFIG_SOC_SDMMC_SUPPORT_XTAL_CLOCK=y
++CONFIG_SOC_SDMMC_DELAY_PHASE_NUM=4
++CONFIG_SOC_TEMPERATURE_SENSOR_SUPPORT_FAST_RC=y
++CONFIG_SOC_WIFI_HW_TSF=y
++CONFIG_SOC_WIFI_FTM_SUPPORT=y
++CONFIG_SOC_WIFI_GCMP_SUPPORT=y
+ CONFIG_SOC_WIFI_WAPI_SUPPORT=y
++CONFIG_SOC_WIFI_TXOP_SUPPORT=y
+ CONFIG_SOC_WIFI_CSI_SUPPORT=y
+ CONFIG_SOC_WIFI_MESH_SUPPORT=y
+ CONFIG_SOC_WIFI_SUPPORT_VARIABLE_BEACON_WINDOW=y
+-CONFIG_SOC_WIFI_NAN_SUPPORT=y
++CONFIG_SOC_WIFI_PHY_NEEDS_USB_WORKAROUND=y
+ CONFIG_SOC_BLE_SUPPORTED=y
+ CONFIG_SOC_BLE_MESH_SUPPORTED=y
+-CONFIG_SOC_BT_CLASSIC_SUPPORTED=y
++CONFIG_SOC_BLE_50_SUPPORTED=y
++CONFIG_SOC_BLE_DEVICE_PRIVACY_SUPPORTED=y
+ CONFIG_SOC_BLUFI_SUPPORTED=y
+-CONFIG_SOC_BT_H2C_ENC_KEY_CTRL_ENH_VSC_SUPPORTED=y
+ CONFIG_SOC_ULP_HAS_ADC=y
+ CONFIG_SOC_PHY_COMBO_MODULE=y
+-CONFIG_SOC_EMAC_RMII_CLK_OUT_INTERNAL_LOOPBACK=y
++CONFIG_SOC_LCDCAM_CAM_SUPPORT_RGB_YUV_CONV=y
++CONFIG_SOC_LCDCAM_CAM_PERIPH_NUM=1
++CONFIG_SOC_LCDCAM_CAM_DATA_WIDTH_MAX=16
+ CONFIG_IDF_CMAKE=y
+ CONFIG_IDF_TOOLCHAIN="gcc"
+ CONFIG_IDF_TOOLCHAIN_GCC=y
+ CONFIG_IDF_TARGET_ARCH_XTENSA=y
+ CONFIG_IDF_TARGET_ARCH="xtensa"
+-CONFIG_IDF_TARGET="esp32"
+-CONFIG_IDF_INIT_VERSION="5.4.2"
+-CONFIG_IDF_TARGET_ESP32=y
+-CONFIG_IDF_FIRMWARE_CHIP_ID=0x0000
++CONFIG_IDF_TARGET="esp32s3"
++CONFIG_IDF_INIT_VERSION="5.4.4"
++CONFIG_IDF_TARGET_ESP32S3=y
++CONFIG_IDF_FIRMWARE_CHIP_ID=0x0009
  
- joystick_data_t joystick_data;
+ #
+ # Build type
+@@ -261,8 +396,6 @@ CONFIG_APP_BUILD_BOOTLOADER=y
+ CONFIG_APP_BUILD_USE_FLASH_SECTIONS=y
+ # CONFIG_APP_REPRODUCIBLE_BUILD is not set
+ # CONFIG_APP_NO_BLOBS is not set
+-# CONFIG_APP_COMPATIBLE_PRE_V2_1_BOOTLOADERS is not set
+-# CONFIG_APP_COMPATIBLE_PRE_V3_1_BOOTLOADERS is not set
+ # end of Build type
  
-+static constexpr uint8_t DISPLAY_BRIGHTNESS_NORMAL = 35;
-+static constexpr uint8_t DISPLAY_BRIGHTNESS_LOW_BAT = 18;
-+static constexpr uint8_t DISPLAY_BRIGHTNESS_CHARGING = 12;
-+static constexpr int8_t LOW_BATTERY_ENTER_THRESHOLD = 22;
-+static constexpr int8_t LOW_BATTERY_EXIT_THRESHOLD = 32;
-+static constexpr TickType_t POWER_PROFILE_STABLE_TICKS = pdMS_TO_TICKS(5000);
+ #
+@@ -276,7 +409,7 @@ CONFIG_BOOTLOADER_COMPILE_TIME_DATE=y
+ CONFIG_BOOTLOADER_PROJECT_VER=1
+ # end of Bootloader manager
+ 
+-CONFIG_BOOTLOADER_OFFSET_IN_FLASH=0x1000
++CONFIG_BOOTLOADER_OFFSET_IN_FLASH=0x0
+ CONFIG_BOOTLOADER_COMPILER_OPTIMIZATION_SIZE=y
+ # CONFIG_BOOTLOADER_COMPILER_OPTIMIZATION_DEBUG is not set
+ # CONFIG_BOOTLOADER_COMPILER_OPTIMIZATION_PERF is not set
+@@ -308,7 +441,6 @@ CONFIG_BOOTLOADER_LOG_TIMESTAMP_SOURCE_CPU_TICKS=y
+ CONFIG_BOOTLOADER_FLASH_XMC_SUPPORT=y
+ # end of Serial Flash Configurations
+ 
+-# CONFIG_BOOTLOADER_VDDSDIO_BOOST_1_8V is not set
+ CONFIG_BOOTLOADER_VDDSDIO_BOOST_1_9V=y
+ # CONFIG_BOOTLOADER_FACTORY_RESET is not set
+ # CONFIG_BOOTLOADER_APP_TEST is not set
+@@ -327,10 +459,12 @@ CONFIG_BOOTLOADER_RESERVE_RTC_SIZE=0
+ #
+ # Security features
+ #
+-CONFIG_SECURE_BOOT_V1_SUPPORTED=y
++CONFIG_SECURE_BOOT_V2_RSA_SUPPORTED=y
++CONFIG_SECURE_BOOT_V2_PREFERRED=y
+ # CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT is not set
+ # CONFIG_SECURE_BOOT is not set
+ # CONFIG_SECURE_FLASH_ENC_ENABLED is not set
++CONFIG_SECURE_ROM_DL_MODE_ENABLED=y
+ # end of Security features
+ 
+ #
+@@ -347,41 +481,67 @@ CONFIG_ESP_ROM_HAS_CRC_LE=y
+ CONFIG_ESP_ROM_HAS_CRC_BE=y
+ CONFIG_ESP_ROM_HAS_MZ_CRC32=y
+ CONFIG_ESP_ROM_HAS_JPEG_DECODE=y
+-CONFIG_ESP_ROM_HAS_UART_BUF_SWITCH=y
++CONFIG_ESP_ROM_UART_CLK_IS_XTAL=y
++CONFIG_ESP_ROM_HAS_RETARGETABLE_LOCKING=y
++CONFIG_ESP_ROM_USB_OTG_NUM=3
++CONFIG_ESP_ROM_USB_SERIAL_DEVICE_NUM=4
++CONFIG_ESP_ROM_HAS_ERASE_0_REGION_BUG=y
++CONFIG_ESP_ROM_HAS_ENCRYPTED_WRITES_USING_LEGACY_DRV=y
++CONFIG_ESP_ROM_GET_CLK_FREQ=y
++CONFIG_ESP_ROM_HAS_HAL_WDT=y
+ CONFIG_ESP_ROM_NEEDS_SWSETUP_WORKAROUND=y
++CONFIG_ESP_ROM_HAS_LAYOUT_TABLE=y
++CONFIG_ESP_ROM_HAS_SPI_FLASH=y
++CONFIG_ESP_ROM_HAS_ETS_PRINTF_BUG=y
+ CONFIG_ESP_ROM_HAS_NEWLIB=y
+ CONFIG_ESP_ROM_HAS_NEWLIB_NANO_FORMAT=y
+ CONFIG_ESP_ROM_HAS_NEWLIB_32BIT_TIME=y
++CONFIG_ESP_ROM_NEEDS_SET_CACHE_MMU_SIZE=y
++CONFIG_ESP_ROM_RAM_APP_NEEDS_MMU_INIT=y
++CONFIG_ESP_ROM_HAS_FLASH_COUNT_PAGES_BUG=y
++CONFIG_ESP_ROM_HAS_CACHE_SUSPEND_WAITI_BUG=y
++CONFIG_ESP_ROM_HAS_CACHE_WRITEBACK_BUG=y
+ CONFIG_ESP_ROM_HAS_SW_FLOAT=y
+-CONFIG_ESP_ROM_USB_OTG_NUM=-1
+-CONFIG_ESP_ROM_USB_SERIAL_DEVICE_NUM=-1
++CONFIG_ESP_ROM_HAS_VERSION=y
+ CONFIG_ESP_ROM_SUPPORT_DEEP_SLEEP_WAKEUP_STUB=y
+ CONFIG_ESP_ROM_HAS_OUTPUT_PUTC_FUNC=y
++CONFIG_ESP_ROM_CONSOLE_OUTPUT_SECONDARY=y
 +
-+enum power_display_mode_t : uint8_t {
-+    POWER_DISPLAY_NORMAL,
-+    POWER_DISPLAY_LOW_BATTERY,
-+    POWER_DISPLAY_CHARGING,
-+};
-+
-+static uint8_t brightness_for_mode(power_display_mode_t mode)
-+{
-+    switch (mode) {
-+    case POWER_DISPLAY_CHARGING:
-+        return DISPLAY_BRIGHTNESS_CHARGING;
-+    case POWER_DISPLAY_LOW_BATTERY:
-+        return DISPLAY_BRIGHTNESS_LOW_BAT;
-+    case POWER_DISPLAY_NORMAL:
-+    default:
-+        return DISPLAY_BRIGHTNESS_NORMAL;
-+    }
-+}
-+
-+static void apply_power_profile(int8_t battery_level, bool charging)
-+{
-+    static uint8_t current_brightness = 0xFF;
-+    static power_display_mode_t active_mode = POWER_DISPLAY_NORMAL;
-+    static power_display_mode_t pending_mode = POWER_DISPLAY_NORMAL;
-+    static TickType_t pending_since = 0;
-+    static bool low_battery_mode = false;
-+    static bool initialized = false;
-+
-+    if (battery_level > 0) {
-+        if (battery_level <= LOW_BATTERY_ENTER_THRESHOLD) {
-+            low_battery_mode = true;
-+        } else if (battery_level >= LOW_BATTERY_EXIT_THRESHOLD) {
-+            low_battery_mode = false;
-+        }
-+    }
-+
-+    power_display_mode_t requested_mode = POWER_DISPLAY_NORMAL;
-+    if (charging) {
-+        requested_mode = POWER_DISPLAY_CHARGING;
-+    } else if (low_battery_mode) {
-+        requested_mode = POWER_DISPLAY_LOW_BATTERY;
-+    }
-+
-+    TickType_t now = xTaskGetTickCount();
-+    if (!initialized) {
-+        active_mode = requested_mode;
-+        pending_mode = requested_mode;
-+        initialized = true;
-+    } else if (requested_mode == active_mode) {
-+        pending_mode = requested_mode;
-+        pending_since = now;
-+    } else if (requested_mode != pending_mode) {
-+        pending_mode = requested_mode;
-+        pending_since = now;
-+    } else if ((now - pending_since) >= POWER_PROFILE_STABLE_TICKS) {
-+        active_mode = requested_mode;
-+    }
-+
-+    uint8_t target_brightness = brightness_for_mode(active_mode);
-+    if (current_brightness != target_brightness) {
-+        M5.Display.setBrightness(target_brightness);
-+        current_brightness = target_brightness;
-+    }
-+}
-+
- // extern void lvgl_port_init(M5GFX &gfx);
++#
++# Boot ROM Behavior
++#
++CONFIG_BOOT_ROM_LOG_ALWAYS_ON=y
++# CONFIG_BOOT_ROM_LOG_ALWAYS_OFF is not set
++# CONFIG_BOOT_ROM_LOG_ON_GPIO_HIGH is not set
++# CONFIG_BOOT_ROM_LOG_ON_GPIO_LOW is not set
++# end of Boot ROM Behavior
  
- /**
-@@ -89,7 +161,9 @@ void app_main(void)
-     auto cfg = M5.config();
-     M5.begin(cfg);
-     M5.Power.begin();
-+    M5.Power.setBatteryCharge(true);
-     M5.Power.setExtOutput(true);  // Enable StickS3 Grove/Hat 5V output for Unit Joystick2.
-+    apply_power_profile(100, false);
-     M5.Imu.init(&M5.In_I2C);        // init IMU with internal I2C port
-     printf("IN_I2C port: %d\n", M5.In_I2C.getPort());
-     printf("M5 Display width: %ld, height: %ld\n", M5.Display.width(), M5.Display.height());
-@@ -115,6 +189,7 @@ void app_main(void)
+ #
+ # Serial flasher config
+ #
+ # CONFIG_ESPTOOLPY_NO_STUB is not set
++# CONFIG_ESPTOOLPY_OCT_FLASH is not set
++CONFIG_ESPTOOLPY_FLASH_MODE_AUTO_DETECT=y
+ # CONFIG_ESPTOOLPY_FLASHMODE_QIO is not set
+ # CONFIG_ESPTOOLPY_FLASHMODE_QOUT is not set
+ CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+ # CONFIG_ESPTOOLPY_FLASHMODE_DOUT is not set
+ CONFIG_ESPTOOLPY_FLASH_SAMPLE_MODE_STR=y
+ CONFIG_ESPTOOLPY_FLASHMODE="dio"
+-# CONFIG_ESPTOOLPY_FLASHFREQ_80M is not set
+-CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
+-# CONFIG_ESPTOOLPY_FLASHFREQ_26M is not set
++# CONFIG_ESPTOOLPY_FLASHFREQ_120M is not set
++CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
++# CONFIG_ESPTOOLPY_FLASHFREQ_40M is not set
+ # CONFIG_ESPTOOLPY_FLASHFREQ_20M is not set
+-CONFIG_ESPTOOLPY_FLASHFREQ="40m"
++CONFIG_ESPTOOLPY_FLASHFREQ="80m"
+ # CONFIG_ESPTOOLPY_FLASHSIZE_1MB is not set
+ # CONFIG_ESPTOOLPY_FLASHSIZE_2MB is not set
+-CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+-# CONFIG_ESPTOOLPY_FLASHSIZE_8MB is not set
++# CONFIG_ESPTOOLPY_FLASHSIZE_4MB is not set
++CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+ # CONFIG_ESPTOOLPY_FLASHSIZE_16MB is not set
+ # CONFIG_ESPTOOLPY_FLASHSIZE_32MB is not set
+ # CONFIG_ESPTOOLPY_FLASHSIZE_64MB is not set
+ # CONFIG_ESPTOOLPY_FLASHSIZE_128MB is not set
+-CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
++CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+ # CONFIG_ESPTOOLPY_HEADER_FLASHSIZE_UPDATE is not set
+ CONFIG_ESPTOOLPY_BEFORE_RESET=y
+ # CONFIG_ESPTOOLPY_BEFORE_NORESET is not set
+@@ -396,12 +556,12 @@ CONFIG_ESPTOOLPY_MONITOR_BAUD=115200
+ # Partition Table
+ #
+ # CONFIG_PARTITION_TABLE_SINGLE_APP is not set
+-CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
++# CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE is not set
+ # CONFIG_PARTITION_TABLE_TWO_OTA is not set
+ # CONFIG_PARTITION_TABLE_TWO_OTA_LARGE is not set
+-# CONFIG_PARTITION_TABLE_CUSTOM is not set
+-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+-CONFIG_PARTITION_TABLE_FILENAME="partitions_singleapp_large.csv"
++CONFIG_PARTITION_TABLE_CUSTOM=y
++CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_sticks3.csv"
++CONFIG_PARTITION_TABLE_FILENAME="partitions_sticks3.csv"
+ CONFIG_PARTITION_TABLE_OFFSET=0x8000
+ CONFIG_PARTITION_TABLE_MD5=y
+ # end of Partition Table
+@@ -452,6 +612,7 @@ CONFIG_COMPILER_ORPHAN_SECTIONS_WARNING=y
+ CONFIG_APPTRACE_DEST_NONE=y
+ # CONFIG_APPTRACE_DEST_UART1 is not set
+ # CONFIG_APPTRACE_DEST_UART2 is not set
++# CONFIG_APPTRACE_DEST_USB_CDC is not set
+ CONFIG_APPTRACE_DEST_UART_NONE=y
+ CONFIG_APPTRACE_UART_TASK_PRIO=1
+ CONFIG_APPTRACE_LOCK_ENABLE=y
+@@ -465,7 +626,16 @@ CONFIG_APPTRACE_LOCK_ENABLE=y
+ #
+ # Common Options
+ #
++
++#
++# BLE Log
++#
++# CONFIG_BLE_LOG_ENABLED is not set
++# end of BLE Log
++
+ # CONFIG_BT_BLE_LOG_SPI_OUT_ENABLED is not set
++# CONFIG_BT_BLE_LOG_UHCI_OUT_ENABLED is not set
++# CONFIG_BT_LE_USED_MEM_STATISTICS_ENABLED is not set
+ # end of Common Options
+ # end of Bluetooth
  
-         joystick_data.bat = (joystick_data.bat > 100) ? 100 : joystick_data.bat;
-         joystick_data.bat = (joystick_data.bat < 0) ? 0 : joystick_data.bat;
-+        apply_power_profile(joystick_data.bat, M5.Power.isCharging() == Power_Class::is_charging);
+@@ -483,37 +653,22 @@ CONFIG_APPTRACE_LOCK_ENABLE=y
+ # TWAI Configuration
+ #
+ # CONFIG_TWAI_ISR_IN_IRAM is not set
+-CONFIG_TWAI_ERRATA_FIX_BUS_OFF_REC=y
+-CONFIG_TWAI_ERRATA_FIX_TX_INTR_LOST=y
+-CONFIG_TWAI_ERRATA_FIX_RX_FRAME_INVALID=y
+-CONFIG_TWAI_ERRATA_FIX_RX_FIFO_CORRUPT=y
+ CONFIG_TWAI_ERRATA_FIX_LISTEN_ONLY_DOM=y
+ # end of TWAI Configuration
  
-         M5.Imu.update();                              // update IMU data
-         imu_data              = M5.Imu.getImuData();  // get IMU data
-diff --git a/remote/code/main/joystick/joystick_handle.c b/remote/code/main/joystick/joystick_handle.c
-index daac361..861060f 100644
---- a/remote/code/main/joystick/joystick_handle.c
-+++ b/remote/code/main/joystick/joystick_handle.c
-@@ -15,6 +15,7 @@ i2c_bus_device_handle_t i2c_device1;  // i2c device handle
- #define JOYSTICK_NVS_NAMESPACE "joy_cfg"
- #define JOYSTICK_NVS_INVERT_X  "invert_x"
- #define JOYSTICK_NVS_INVERT_Y  "invert_y"
-+#define RUNNING_LOOP_DELAY_MS   50
+ #
+ # Legacy ADC Driver Configuration
+ #
+-CONFIG_ADC_DISABLE_DAC=y
+ # CONFIG_ADC_SUPPRESS_DEPRECATE_WARN is not set
+ # CONFIG_ADC_SKIP_LEGACY_CONFLICT_CHECK is not set
  
- /**
-  * @brief Initialize joystick via I2C interface
-@@ -246,7 +247,7 @@ void handle_running_screen(void *pvParam)
-                     pkt[7] = joystick_data->btnB_status;
-                     espnow_send_data(pkt, sizeof(pkt));
-                 }
--                vTaskDelay(30 / portTICK_PERIOD_MS);
-+                vTaskDelay(RUNNING_LOOP_DELAY_MS / portTICK_PERIOD_MS);
-                 continue;
-             }
+ #
+ # Legacy ADC Calibration Configuration
+ #
+-CONFIG_ADC_CAL_EFUSE_TP_ENABLE=y
+-CONFIG_ADC_CAL_EFUSE_VREF_ENABLE=y
+-CONFIG_ADC_CAL_LUT_ENABLE=y
+ # CONFIG_ADC_CALI_SUPPRESS_DEPRECATE_WARN is not set
+ # end of Legacy ADC Calibration Configuration
+ # end of Legacy ADC Driver Configuration
  
-@@ -264,7 +265,7 @@ void handle_running_screen(void *pvParam)
-             last_yaw   = yaw_angle;
-             last_pitch = pitch_angle;
-             espnow_send_data(pkt, sizeof(pkt));
--            vTaskDelay(30 / portTICK_PERIOD_MS);
-+            vTaskDelay(RUNNING_LOOP_DELAY_MS / portTICK_PERIOD_MS);
-         } else {
-             vTaskDelay(200 / portTICK_PERIOD_MS);
-         }
-@@ -324,7 +325,7 @@ void handle_imu_screen(void *pvParam)
-             pitch_angle = (int16_t)map(limited_pitch, 0, 1.5, 900, 0);
+-#
+-# Legacy DAC Driver Configurations
+-#
+-# CONFIG_DAC_SUPPRESS_DEPRECATE_WARN is not set
+-# CONFIG_DAC_SKIP_LEGACY_CONFLICT_CHECK is not set
+-# end of Legacy DAC Driver Configurations
+-
+ #
+ # Legacy MCPWM Driver Configurations
+ #
+@@ -561,6 +716,13 @@ CONFIG_ADC_CAL_LUT_ENABLE=y
+ # CONFIG_SDM_SUPPRESS_DEPRECATE_WARN is not set
+ # CONFIG_SDM_SKIP_LEGACY_CONFLICT_CHECK is not set
+ # end of Legacy SDM Driver Configurations
++
++#
++# Legacy Temperature Sensor Driver Configurations
++#
++# CONFIG_TEMP_SENSOR_SUPPRESS_DEPRECATE_WARN is not set
++# CONFIG_TEMP_SENSOR_SKIP_LEGACY_CONFLICT_CHECK is not set
++# end of Legacy Temperature Sensor Driver Configurations
+ # end of Driver Configurations
  
-             if (abs(yaw_angle - last_yaw) < 10 && abs(last_pitch - pitch_angle) < 10) {
--                vTaskDelay(30 / portTICK_PERIOD_MS);
-+                vTaskDelay(RUNNING_LOOP_DELAY_MS / portTICK_PERIOD_MS);
-                 continue;
-             }
-             last_yaw   = yaw_angle;
-@@ -342,7 +343,7 @@ void handle_imu_screen(void *pvParam)
-                                             imu_angle.roll, imu_angle.pitch, yaw_angle, pitch_angle);
- #endif
+ #
+@@ -568,23 +730,21 @@ CONFIG_ADC_CAL_LUT_ENABLE=y
+ #
+ # CONFIG_EFUSE_CUSTOM_TABLE is not set
+ # CONFIG_EFUSE_VIRTUAL is not set
+-# CONFIG_EFUSE_CODE_SCHEME_COMPAT_NONE is not set
+-CONFIG_EFUSE_CODE_SCHEME_COMPAT_3_4=y
+-# CONFIG_EFUSE_CODE_SCHEME_COMPAT_REPEAT is not set
+-CONFIG_EFUSE_MAX_BLK_LEN=192
++CONFIG_EFUSE_MAX_BLK_LEN=256
+ # end of eFuse Bit Manager
  
--            vTaskDelay(30 / portTICK_PERIOD_MS);
-+            vTaskDelay(RUNNING_LOOP_DELAY_MS / portTICK_PERIOD_MS);
-         } else {
-             vTaskDelay(200 / portTICK_PERIOD_MS);
-         }
+ #
+ # ESP-TLS
+ #
+ CONFIG_ESP_TLS_USING_MBEDTLS=y
+-# CONFIG_ESP_TLS_USE_SECURE_ELEMENT is not set
++CONFIG_ESP_TLS_USE_DS_PERIPHERAL=y
+ # CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS is not set
+ # CONFIG_ESP_TLS_SERVER_SESSION_TICKETS is not set
+ # CONFIG_ESP_TLS_SERVER_CERT_SELECT_HOOK is not set
+ # CONFIG_ESP_TLS_SERVER_MIN_AUTH_MODE_OPTIONAL is not set
+ # CONFIG_ESP_TLS_PSK_VERIFICATION is not set
+ # CONFIG_ESP_TLS_INSECURE is not set
++CONFIG_ESP_TLS_DYN_BUF_STRATEGY_SUPPORTED=y
+ # end of ESP-TLS
+ 
+ #
+@@ -592,16 +752,7 @@ CONFIG_ESP_TLS_USING_MBEDTLS=y
+ #
+ # CONFIG_ADC_ONESHOT_CTRL_FUNC_IN_IRAM is not set
+ # CONFIG_ADC_CONTINUOUS_ISR_IRAM_SAFE is not set
+-
+-#
+-# ADC Calibration Configurations
+-#
+-CONFIG_ADC_CALI_EFUSE_TP_ENABLE=y
+-CONFIG_ADC_CALI_EFUSE_VREF_ENABLE=y
+-CONFIG_ADC_CALI_LUT_ENABLE=y
+-# end of ADC Calibration Configurations
+-
+-CONFIG_ADC_DISABLE_DAC_OUTPUT=y
++# CONFIG_ADC_CONTINUOUS_FORCE_USE_ADC2_ON_C3_S3 is not set
+ # CONFIG_ADC_ENABLE_DEBUG_LOG is not set
+ # end of ADC and ADC Calibration
+ 
+@@ -609,6 +760,7 @@ CONFIG_ADC_DISABLE_DAC_OUTPUT=y
+ # Wireless Coexistence
+ #
+ CONFIG_ESP_COEX_ENABLED=y
++# CONFIG_ESP_COEX_EXTERNAL_COEXIST_ENABLE is not set
+ # CONFIG_ESP_COEX_GPIO_DEBUG is not set
+ # end of Wireless Coexistence
+ 
+@@ -619,18 +771,14 @@ CONFIG_ESP_ERR_TO_NAME_LOOKUP=y
+ # end of Common ESP-related
+ 
+ #
+-# ESP-Driver:DAC Configurations
++# ESP-Driver:Camera Controller Configurations
+ #
+-# CONFIG_DAC_CTRL_FUNC_IN_IRAM is not set
+-# CONFIG_DAC_ISR_IRAM_SAFE is not set
+-# CONFIG_DAC_ENABLE_DEBUG_LOG is not set
+-CONFIG_DAC_DMA_AUTO_16BIT_ALIGN=y
+-# end of ESP-Driver:DAC Configurations
++# CONFIG_CAM_CTLR_DVP_CAM_ISR_CACHE_SAFE is not set
++# end of ESP-Driver:Camera Controller Configurations
+ 
+ #
+ # ESP-Driver:GPIO Configurations
+ #
+-# CONFIG_GPIO_ESP32_SUPPORT_SWITCH_SLP_PULL is not set
+ # CONFIG_GPIO_CTRL_FUNC_IN_IRAM is not set
+ # end of ESP-Driver:GPIO Configurations
+ 
+@@ -713,25 +861,36 @@ CONFIG_SPI_SLAVE_ISR_IN_IRAM=y
+ # CONFIG_TOUCH_ENABLE_DEBUG_LOG is not set
+ # end of ESP-Driver:Touch Sensor Configurations
+ 
++#
++# ESP-Driver:Temperature Sensor Configurations
++#
++# CONFIG_TEMP_SENSOR_ENABLE_DEBUG_LOG is not set
++# end of ESP-Driver:Temperature Sensor Configurations
++
+ #
+ # ESP-Driver:UART Configurations
+ #
+ # CONFIG_UART_ISR_IN_IRAM is not set
+ # end of ESP-Driver:UART Configurations
+ 
++#
++# ESP-Driver:UHCI Configurations
++#
++# CONFIG_UHCI_ISR_HANDLER_IN_IRAM is not set
++# CONFIG_UHCI_ISR_CACHE_SAFE is not set
++# CONFIG_UHCI_ENABLE_DEBUG_LOG is not set
++# end of ESP-Driver:UHCI Configurations
++
++#
++# ESP-Driver:USB Serial/JTAG Configuration
++#
++CONFIG_USJ_ENABLE_USB_SERIAL_JTAG=y
++# end of ESP-Driver:USB Serial/JTAG Configuration
++
+ #
+ # Ethernet
+ #
+ CONFIG_ETH_ENABLED=y
+-CONFIG_ETH_USE_ESP32_EMAC=y
+-CONFIG_ETH_PHY_INTERFACE_RMII=y
+-CONFIG_ETH_RMII_CLK_INPUT=y
+-# CONFIG_ETH_RMII_CLK_OUTPUT is not set
+-CONFIG_ETH_RMII_CLK_IN_GPIO=0
+-CONFIG_ETH_DMA_BUFFER_SIZE=512
+-CONFIG_ETH_DMA_RX_BUFFER_NUM=10
+-CONFIG_ETH_DMA_TX_BUFFER_NUM=10
+-# CONFIG_ETH_IRAM_OPTIMIZATION is not set
+ CONFIG_ETH_USE_SPI_ETHERNET=y
+ # CONFIG_ETH_SPI_ETHERNET_DM9051 is not set
+ # CONFIG_ETH_SPI_ETHERNET_W5500 is not set
+@@ -777,7 +936,7 @@ CONFIG_ESP_HTTP_CLIENT_EVENT_POST_TIMEOUT=2000
+ #
+ # HTTP Server
+ #
+-CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
++CONFIG_HTTPD_MAX_REQ_HDR_LEN=512
+ CONFIG_HTTPD_MAX_URI_LEN=512
+ CONFIG_HTTPD_ERR_RESP_NO_DELAY=y
+ CONFIG_HTTPD_PURGE_BUF_LEN=32
+@@ -809,26 +968,22 @@ CONFIG_ESP_HTTPS_SERVER_EVENT_POST_TIMEOUT=2000
+ #
+ # Chip revision
+ #
+-CONFIG_ESP32_REV_MIN_0=y
+-# CONFIG_ESP32_REV_MIN_1 is not set
+-# CONFIG_ESP32_REV_MIN_1_1 is not set
+-# CONFIG_ESP32_REV_MIN_2 is not set
+-# CONFIG_ESP32_REV_MIN_3 is not set
+-# CONFIG_ESP32_REV_MIN_3_1 is not set
+-CONFIG_ESP32_REV_MIN=0
+-CONFIG_ESP32_REV_MIN_FULL=0
++CONFIG_ESP32S3_REV_MIN_0=y
++# CONFIG_ESP32S3_REV_MIN_1 is not set
++# CONFIG_ESP32S3_REV_MIN_2 is not set
++CONFIG_ESP32S3_REV_MIN_FULL=0
+ CONFIG_ESP_REV_MIN_FULL=0
+ 
+ #
+-# Maximum Supported ESP32 Revision (Rev v3.99)
++# Maximum Supported ESP32-S3 Revision (Rev v0.99)
+ #
+-CONFIG_ESP32_REV_MAX_FULL=399
+-CONFIG_ESP_REV_MAX_FULL=399
++CONFIG_ESP32S3_REV_MAX_FULL=99
++CONFIG_ESP_REV_MAX_FULL=99
+ CONFIG_ESP_EFUSE_BLOCK_REV_MIN_FULL=0
+-CONFIG_ESP_EFUSE_BLOCK_REV_MAX_FULL=99
++CONFIG_ESP_EFUSE_BLOCK_REV_MAX_FULL=199
+ 
+ #
+-# Maximum Supported ESP32 eFuse Block Revision (eFuse Block Rev v0.99)
++# Maximum Supported ESP32-S3 eFuse Block Revision (eFuse Block Rev v1.99)
+ #
+ # end of Chip revision
+ 
+@@ -841,10 +996,9 @@ CONFIG_ESP_MAC_ADDR_UNIVERSE_BT=y
+ CONFIG_ESP_MAC_ADDR_UNIVERSE_ETH=y
+ CONFIG_ESP_MAC_UNIVERSAL_MAC_ADDRESSES_FOUR=y
+ CONFIG_ESP_MAC_UNIVERSAL_MAC_ADDRESSES=4
+-# CONFIG_ESP32_UNIVERSAL_MAC_ADDRESSES_TWO is not set
+-CONFIG_ESP32_UNIVERSAL_MAC_ADDRESSES_FOUR=y
+-CONFIG_ESP32_UNIVERSAL_MAC_ADDRESSES=4
+-# CONFIG_ESP_MAC_IGNORE_MAC_CRC_ERROR is not set
++# CONFIG_ESP32S3_UNIVERSAL_MAC_ADDRESSES_TWO is not set
++CONFIG_ESP32S3_UNIVERSAL_MAC_ADDRESSES_FOUR=y
++CONFIG_ESP32S3_UNIVERSAL_MAC_ADDRESSES=4
+ # CONFIG_ESP_MAC_USE_CUSTOM_MAC_AS_BASE_MAC is not set
+ # end of MAC Config
+ 
+@@ -853,9 +1007,9 @@ CONFIG_ESP32_UNIVERSAL_MAC_ADDRESSES=4
+ #
+ # CONFIG_ESP_SLEEP_POWER_DOWN_FLASH is not set
+ CONFIG_ESP_SLEEP_FLASH_LEAKAGE_WORKAROUND=y
+-# CONFIG_ESP_SLEEP_MSPI_NEED_ALL_IO_PU is not set
++CONFIG_ESP_SLEEP_MSPI_NEED_ALL_IO_PU=y
+ CONFIG_ESP_SLEEP_RTC_BUS_ISO_WORKAROUND=y
+-# CONFIG_ESP_SLEEP_GPIO_RESET_WORKAROUND is not set
++CONFIG_ESP_SLEEP_GPIO_RESET_WORKAROUND=y
+ CONFIG_ESP_SLEEP_WAIT_FLASH_READY_EXTRA_DELAY=2000
+ # CONFIG_ESP_SLEEP_CACHE_SAFE_ASSERTION is not set
+ # CONFIG_ESP_SLEEP_DEBUG is not set
+@@ -875,16 +1029,23 @@ CONFIG_RTC_CLK_CAL_CYCLES=1024
+ #
+ # Peripheral Control
+ #
+-CONFIG_PERIPH_CTRL_FUNC_IN_IRAM=y
++# CONFIG_PERIPH_CTRL_FUNC_IN_IRAM is not set
+ # end of Peripheral Control
+ 
++#
++# GDMA Configurations
++#
++CONFIG_GDMA_CTRL_FUNC_IN_IRAM=y
++CONFIG_GDMA_ISR_HANDLER_IN_IRAM=y
++CONFIG_GDMA_OBJ_DRAM_SAFE=y
++# CONFIG_GDMA_ENABLE_DEBUG_LOG is not set
++# CONFIG_GDMA_ISR_IRAM_SAFE is not set
++# end of GDMA Configurations
++
+ #
+ # Main XTAL Config
+ #
+-# CONFIG_XTAL_FREQ_26 is not set
+-# CONFIG_XTAL_FREQ_32 is not set
+ CONFIG_XTAL_FREQ_40=y
+-# CONFIG_XTAL_FREQ_AUTO is not set
+ CONFIG_XTAL_FREQ=40
+ # end of Main XTAL Config
+ 
+@@ -894,12 +1055,15 @@ CONFIG_ESP_SPI_BUS_LOCK_ISR_FUNCS_IN_IRAM=y
+ #
+ # ESP-Driver:LCD Controller Configurations
+ #
++# CONFIG_LCD_RGB_ISR_IRAM_SAFE is not set
++# CONFIG_LCD_RGB_RESTART_IN_VSYNC is not set
+ # CONFIG_LCD_ENABLE_DEBUG_LOG is not set
+ # end of ESP-Driver:LCD Controller Configurations
+ 
+ #
+ # ESP-MM: Memory Management Configurations
+ #
++# CONFIG_ESP_MM_CACHE_MSYNC_C2M_CHUNKED_OPS is not set
+ # end of ESP-MM: Memory Management Configurations
+ 
+ #
+@@ -931,20 +1095,26 @@ CONFIG_ESP_PHY_CALIBRATION_AND_DATA_STORAGE=y
+ CONFIG_ESP_PHY_MAX_WIFI_TX_POWER=20
+ CONFIG_ESP_PHY_MAX_TX_POWER=20
+ # CONFIG_ESP_PHY_REDUCE_TX_POWER is not set
++CONFIG_ESP_PHY_ENABLE_USB=y
+ # CONFIG_ESP_PHY_ENABLE_CERT_TEST is not set
+ CONFIG_ESP_PHY_RF_CAL_PARTIAL=y
+ # CONFIG_ESP_PHY_RF_CAL_NONE is not set
+ # CONFIG_ESP_PHY_RF_CAL_FULL is not set
+ CONFIG_ESP_PHY_CALIBRATION_MODE=0
++CONFIG_ESP_PHY_PLL_TRACK_PERIOD_MS=1000
+ # CONFIG_ESP_PHY_PLL_TRACK_DEBUG is not set
+ # CONFIG_ESP_PHY_RECORD_USED_TIME is not set
++CONFIG_ESP_PHY_IRAM_OPT=y
++# CONFIG_ESP_PHY_DEBUG is not set
+ # end of PHY
+ 
+ #
+ # Power Management
+ #
+ # CONFIG_PM_ENABLE is not set
+-CONFIG_PM_SLP_IRAM_OPT=y
++# CONFIG_PM_SLP_IRAM_OPT is not set
++CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP=y
++CONFIG_PM_RESTORE_CACHE_TAGMEM_AFTER_LIGHT_SLEEP=y
+ # end of Power Management
+ 
+ #
+@@ -973,22 +1143,42 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=160
+ 
+ #
+-# Memory
+-#
+-# CONFIG_ESP32_USE_FIXED_STATIC_RAM_SIZE is not set
++# Cache config
++#
++CONFIG_ESP32S3_INSTRUCTION_CACHE_16KB=y
++# CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB is not set
++CONFIG_ESP32S3_INSTRUCTION_CACHE_SIZE=0x4000
++# CONFIG_ESP32S3_INSTRUCTION_CACHE_4WAYS is not set
++CONFIG_ESP32S3_INSTRUCTION_CACHE_8WAYS=y
++CONFIG_ESP32S3_ICACHE_ASSOCIATED_WAYS=8
++# CONFIG_ESP32S3_INSTRUCTION_CACHE_LINE_16B is not set
++CONFIG_ESP32S3_INSTRUCTION_CACHE_LINE_32B=y
++CONFIG_ESP32S3_INSTRUCTION_CACHE_LINE_SIZE=32
++# CONFIG_ESP32S3_DATA_CACHE_16KB is not set
++CONFIG_ESP32S3_DATA_CACHE_32KB=y
++# CONFIG_ESP32S3_DATA_CACHE_64KB is not set
++CONFIG_ESP32S3_DATA_CACHE_SIZE=0x8000
++# CONFIG_ESP32S3_DATA_CACHE_4WAYS is not set
++CONFIG_ESP32S3_DATA_CACHE_8WAYS=y
++CONFIG_ESP32S3_DCACHE_ASSOCIATED_WAYS=8
++# CONFIG_ESP32S3_DATA_CACHE_LINE_16B is not set
++CONFIG_ESP32S3_DATA_CACHE_LINE_32B=y
++# CONFIG_ESP32S3_DATA_CACHE_LINE_64B is not set
++CONFIG_ESP32S3_DATA_CACHE_LINE_SIZE=32
++# end of Cache config
+ 
+ #
+-# Non-backward compatible options
++# Memory
+ #
+-# CONFIG_ESP_SYSTEM_ESP32_SRAM1_REGION_AS_IRAM is not set
+-# end of Non-backward compatible options
++# CONFIG_ESP32S3_RTCDATA_IN_FAST_MEM is not set
++# CONFIG_ESP32S3_USE_FIXED_STATIC_RAM_SIZE is not set
+ # end of Memory
+ 
+ #
+ # Trace memory
+ #
+-# CONFIG_ESP32_TRAX is not set
+-CONFIG_ESP32_TRACEMEM_RESERVE_DRAM=0x0
++# CONFIG_ESP32S3_TRAX is not set
++CONFIG_ESP32S3_TRACEMEM_RESERVE_DRAM=0x0
+ # end of Trace memory
+ 
+ # CONFIG_ESP_SYSTEM_PANIC_PRINT_HALT is not set
+@@ -996,10 +1186,14 @@ CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+ # CONFIG_ESP_SYSTEM_PANIC_SILENT_REBOOT is not set
+ # CONFIG_ESP_SYSTEM_PANIC_GDBSTUB is not set
+ CONFIG_ESP_SYSTEM_PANIC_REBOOT_DELAY_SECONDS=0
++CONFIG_ESP_SYSTEM_RTC_FAST_MEM_AS_HEAP_DEPCHECK=y
++CONFIG_ESP_SYSTEM_ALLOW_RTC_FAST_MEM_AS_HEAP=y
+ 
+ #
+ # Memory protection
+ #
++CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=y
++CONFIG_ESP_SYSTEM_MEMPROT_FEATURE_LOCK=y
+ # end of Memory protection
+ 
+ CONFIG_ESP_SYSTEM_EVENT_QUEUE_SIZE=32
+@@ -1011,8 +1205,13 @@ CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0=y
+ CONFIG_ESP_MAIN_TASK_AFFINITY=0x0
+ CONFIG_ESP_MINIMAL_SHARED_STACK_SIZE=2048
+ CONFIG_ESP_CONSOLE_UART_DEFAULT=y
++# CONFIG_ESP_CONSOLE_USB_CDC is not set
++# CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG is not set
+ # CONFIG_ESP_CONSOLE_UART_CUSTOM is not set
+ # CONFIG_ESP_CONSOLE_NONE is not set
++# CONFIG_ESP_CONSOLE_SECONDARY_NONE is not set
++CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
++CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG_ENABLED=y
+ CONFIG_ESP_CONSOLE_UART=y
+ CONFIG_ESP_CONSOLE_UART_NUM=0
+ CONFIG_ESP_CONSOLE_ROM_SERIAL_PORT_NUM=0
+@@ -1029,32 +1228,30 @@ CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=y
+ # CONFIG_ESP_PANIC_HANDLER_IRAM is not set
+ # CONFIG_ESP_DEBUG_STUBS_ENABLE is not set
+ CONFIG_ESP_DEBUG_OCDAWARE=y
+-# CONFIG_ESP_SYSTEM_CHECK_INT_LEVEL_5 is not set
+ CONFIG_ESP_SYSTEM_CHECK_INT_LEVEL_4=y
+ 
+ #
+ # Brownout Detector
+ #
+ CONFIG_ESP_BROWNOUT_DET=y
+-CONFIG_ESP_BROWNOUT_DET_LVL_SEL_0=y
+-# CONFIG_ESP_BROWNOUT_DET_LVL_SEL_1 is not set
+-# CONFIG_ESP_BROWNOUT_DET_LVL_SEL_2 is not set
+-# CONFIG_ESP_BROWNOUT_DET_LVL_SEL_3 is not set
+-# CONFIG_ESP_BROWNOUT_DET_LVL_SEL_4 is not set
+-# CONFIG_ESP_BROWNOUT_DET_LVL_SEL_5 is not set
++CONFIG_ESP_BROWNOUT_DET_LVL_SEL_7=y
+ # CONFIG_ESP_BROWNOUT_DET_LVL_SEL_6 is not set
+-# CONFIG_ESP_BROWNOUT_DET_LVL_SEL_7 is not set
+-CONFIG_ESP_BROWNOUT_DET_LVL=0
++# CONFIG_ESP_BROWNOUT_DET_LVL_SEL_5 is not set
++# CONFIG_ESP_BROWNOUT_DET_LVL_SEL_4 is not set
++# CONFIG_ESP_BROWNOUT_DET_LVL_SEL_3 is not set
++# CONFIG_ESP_BROWNOUT_DET_LVL_SEL_2 is not set
++# CONFIG_ESP_BROWNOUT_DET_LVL_SEL_1 is not set
++CONFIG_ESP_BROWNOUT_DET_LVL=7
+ # end of Brownout Detector
+ 
+-# CONFIG_ESP32_DISABLE_BASIC_ROM_CONSOLE is not set
+ CONFIG_ESP_SYSTEM_BROWNOUT_INTR=y
++CONFIG_ESP_SYSTEM_BBPLL_RECALIB=y
+ # end of ESP System Settings
+ 
+ #
+ # IPC (Inter-Processor Call)
+ #
+-CONFIG_ESP_IPC_TASK_STACK_SIZE=1024
++CONFIG_ESP_IPC_TASK_STACK_SIZE=1280
+ CONFIG_ESP_IPC_USES_CALLERS_PRIORITY=y
+ CONFIG_ESP_IPC_ISR_ENABLE=y
+ # end of IPC (Inter-Processor Call)
+@@ -1072,7 +1269,7 @@ CONFIG_ESP_TIMER_TASK_AFFINITY=0x0
+ CONFIG_ESP_TIMER_TASK_AFFINITY_CPU0=y
+ CONFIG_ESP_TIMER_ISR_AFFINITY_CPU0=y
+ # CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD is not set
+-CONFIG_ESP_TIMER_IMPL_TG0_LAC=y
++CONFIG_ESP_TIMER_IMPL_SYSTIMER=y
+ # end of ESP Timer (High Resolution Timer)
+ 
+ #
+@@ -1110,15 +1307,17 @@ CONFIG_ESP_WIFI_ENABLE_WPA3_OWE_STA=y
+ CONFIG_ESP_WIFI_SLP_DEFAULT_MIN_ACTIVE_TIME=50
+ CONFIG_ESP_WIFI_SLP_DEFAULT_MAX_ACTIVE_TIME=10
+ CONFIG_ESP_WIFI_SLP_DEFAULT_WAIT_BROADCAST_DATA_TIME=15
++# CONFIG_ESP_WIFI_FTM_ENABLE is not set
+ CONFIG_ESP_WIFI_STA_DISCONNECTED_PM_ENABLE=y
++# CONFIG_ESP_WIFI_GCMP_SUPPORT is not set
+ CONFIG_ESP_WIFI_GMAC_SUPPORT=y
+ CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
+ # CONFIG_ESP_WIFI_SLP_BEACON_LOST_OPT is not set
+ CONFIG_ESP_WIFI_ESPNOW_MAX_ENCRYPT_NUM=7
+-# CONFIG_ESP_WIFI_NAN_ENABLE is not set
+ CONFIG_ESP_WIFI_MBEDTLS_CRYPTO=y
+ CONFIG_ESP_WIFI_MBEDTLS_TLS_CLIENT=y
+ # CONFIG_ESP_WIFI_WAPI_PSK is not set
++# CONFIG_ESP_WIFI_SUITE_B_192 is not set
+ # CONFIG_ESP_WIFI_11KV_SUPPORT is not set
+ # CONFIG_ESP_WIFI_MBO_SUPPORT is not set
+ # CONFIG_ESP_WIFI_DPP_SUPPORT is not set
+@@ -1130,10 +1329,10 @@ CONFIG_ESP_WIFI_MBEDTLS_TLS_CLIENT=y
+ #
+ # CONFIG_ESP_WIFI_WPS_STRICT is not set
+ # CONFIG_ESP_WIFI_WPS_PASSPHRASE is not set
++# CONFIG_ESP_WIFI_WPS_RECONNECT_ON_FAIL is not set
+ # end of WPS Configuration Options
+ 
+ # CONFIG_ESP_WIFI_DEBUG_PRINT is not set
+-# CONFIG_ESP_WIFI_TESTING_OPTIONS is not set
+ CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=y
+ # CONFIG_ESP_WIFI_ENT_FREE_DYNAMIC_BUFFER is not set
+ # end of Wi-Fi
+@@ -1247,10 +1446,10 @@ CONFIG_FREERTOS_CHECK_MUTEX_GIVEN_BY_OWNER=y
+ CONFIG_FREERTOS_ISR_STACKSIZE=1536
+ CONFIG_FREERTOS_INTERRUPT_BACKTRACE=y
+ # CONFIG_FREERTOS_FPU_IN_ISR is not set
+-CONFIG_FREERTOS_TICK_SUPPORT_CORETIMER=y
+-CONFIG_FREERTOS_CORETIMER_0=y
+-# CONFIG_FREERTOS_CORETIMER_1 is not set
+-CONFIG_FREERTOS_SYSTICK_USES_CCOUNT=y
++CONFIG_FREERTOS_TICK_SUPPORT_SYSTIMER=y
++CONFIG_FREERTOS_CORETIMER_SYSTIMER_LVL1=y
++# CONFIG_FREERTOS_CORETIMER_SYSTIMER_LVL3 is not set
++CONFIG_FREERTOS_SYSTICK_USES_SYSTIMER=y
+ # CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH is not set
+ # CONFIG_FREERTOS_CHECK_PORT_CRITICAL_COMPLIANCE is not set
+ # end of Port
+@@ -1277,6 +1476,7 @@ CONFIG_HAL_ASSERTION_EQUALS_SYSTEM=y
+ # CONFIG_HAL_ASSERTION_SILENT is not set
+ # CONFIG_HAL_ASSERTION_ENABLE is not set
+ CONFIG_HAL_DEFAULT_ASSERTION_LEVEL=2
++CONFIG_HAL_WDT_USE_ROM_IMPL=y
+ CONFIG_HAL_SPI_MASTER_FUNC_IN_IRAM=y
+ CONFIG_HAL_SPI_SLAVE_FUNC_IN_IRAM=y
+ # end of Hardware Abstraction Layer (HAL) and Low Level (LL)
+@@ -1455,6 +1655,7 @@ CONFIG_LWIP_IPV6_ND6_NUM_NEIGHBORS=5
+ CONFIG_LWIP_IPV6_ND6_NUM_PREFIXES=5
+ CONFIG_LWIP_IPV6_ND6_NUM_ROUTERS=3
+ CONFIG_LWIP_IPV6_ND6_NUM_DESTINATIONS=10
++# CONFIG_LWIP_IPV6_ND6_ROUTE_INFO_OPTION_SUPPORT is not set
+ # CONFIG_LWIP_PPP_SUPPORT is not set
+ # CONFIG_LWIP_SLIP_SUPPORT is not set
+ 
+@@ -1542,6 +1743,7 @@ CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+ # CONFIG_MBEDTLS_X509_TRUSTED_CERT_CALLBACK is not set
+ # CONFIG_MBEDTLS_SSL_CONTEXT_SERIALIZATION is not set
+ CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=y
++# CONFIG_MBEDTLS_SSL_KEYING_MATERIAL_EXPORT is not set
+ CONFIG_MBEDTLS_PKCS7_C=y
+ # end of mbedTLS v3.x related
+ 
+@@ -1560,9 +1762,13 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_MAX_CERTS=200
+ # CONFIG_MBEDTLS_ECP_RESTARTABLE is not set
+ CONFIG_MBEDTLS_CMAC_C=y
+ CONFIG_MBEDTLS_HARDWARE_AES=y
++CONFIG_MBEDTLS_AES_USE_INTERRUPT=y
++CONFIG_MBEDTLS_AES_INTERRUPT_LEVEL=0
+ CONFIG_MBEDTLS_GCM_SUPPORT_NON_AES_CIPHER=y
+ CONFIG_MBEDTLS_HARDWARE_MPI=y
+ # CONFIG_MBEDTLS_LARGE_KEY_SOFTWARE_MPI is not set
++CONFIG_MBEDTLS_MPI_USE_INTERRUPT=y
++CONFIG_MBEDTLS_MPI_INTERRUPT_LEVEL=0
+ CONFIG_MBEDTLS_HARDWARE_SHA=y
+ CONFIG_MBEDTLS_ROM_MD5=y
+ # CONFIG_MBEDTLS_ATCA_HW_ECDSA_SIGN is not set
+@@ -1691,6 +1897,7 @@ CONFIG_NEWLIB_TIME_SYSCALL_USE_RTC_HRT=y
+ #
+ # NVS
+ #
++# CONFIG_NVS_ENCRYPTION is not set
+ # CONFIG_NVS_ASSERT_ERROR_CHECK is not set
+ # CONFIG_NVS_LEGACY_DUP_KEYS_COMPATIBILITY is not set
+ # end of NVS
+@@ -1705,6 +1912,8 @@ CONFIG_NEWLIB_TIME_SYSCALL_USE_RTC_HRT=y
+ #
+ # CONFIG_OPENTHREAD_SPINEL_ONLY is not set
+ # end of OpenThread Spinel
++
++# CONFIG_OPENTHREAD_DEBUG is not set
+ # end of OpenThread
+ 
+ #
+@@ -1755,6 +1964,13 @@ CONFIG_SPI_FLASH_BROWNOUT_RESET=y
+ #
+ # Features here require specific hardware (READ DOCS FIRST!)
+ #
++# CONFIG_SPI_FLASH_HPM_ENA is not set
++CONFIG_SPI_FLASH_HPM_AUTO=y
++# CONFIG_SPI_FLASH_HPM_DIS is not set
++CONFIG_SPI_FLASH_HPM_ON=y
++CONFIG_SPI_FLASH_HPM_DC_AUTO=y
++# CONFIG_SPI_FLASH_HPM_DC_DISABLE is not set
++# CONFIG_SPI_FLASH_AUTO_SUSPEND is not set
+ CONFIG_SPI_FLASH_SUSPEND_TSUS_VAL_US=50
+ # CONFIG_SPI_FLASH_FORCE_ENABLE_XMC_C_SUSPEND is not set
+ # CONFIG_SPI_FLASH_FORCE_ENABLE_C6_H2_SUSPEND is not set
+@@ -1767,10 +1983,10 @@ CONFIG_SPI_FLASH_SUSPEND_TSUS_VAL_US=50
+ # CONFIG_SPI_FLASH_VERIFY_WRITE is not set
+ # CONFIG_SPI_FLASH_ENABLE_COUNTERS is not set
+ CONFIG_SPI_FLASH_ROM_DRIVER_PATCH=y
++# CONFIG_SPI_FLASH_ROM_IMPL is not set
+ CONFIG_SPI_FLASH_DANGEROUS_WRITE_ABORTS=y
+ # CONFIG_SPI_FLASH_DANGEROUS_WRITE_FAILS is not set
+ # CONFIG_SPI_FLASH_DANGEROUS_WRITE_ALLOWED is not set
+-# CONFIG_SPI_FLASH_SHARE_SPI1_BUS is not set
+ # CONFIG_SPI_FLASH_BYPASS_BLOCK_ERASE is not set
+ CONFIG_SPI_FLASH_YIELD_DURING_ERASE=y
+ CONFIG_SPI_FLASH_ERASE_YIELD_DURATION_MS=20
+@@ -1788,12 +2004,15 @@ CONFIG_SPI_FLASH_VENDOR_GD_SUPPORTED=y
+ CONFIG_SPI_FLASH_VENDOR_ISSI_SUPPORTED=y
+ CONFIG_SPI_FLASH_VENDOR_MXIC_SUPPORTED=y
+ CONFIG_SPI_FLASH_VENDOR_WINBOND_SUPPORTED=y
++CONFIG_SPI_FLASH_VENDOR_BOYA_SUPPORTED=y
++CONFIG_SPI_FLASH_VENDOR_TH_SUPPORTED=y
+ CONFIG_SPI_FLASH_SUPPORT_ISSI_CHIP=y
+ CONFIG_SPI_FLASH_SUPPORT_MXIC_CHIP=y
+ CONFIG_SPI_FLASH_SUPPORT_GD_CHIP=y
+ CONFIG_SPI_FLASH_SUPPORT_WINBOND_CHIP=y
+-# CONFIG_SPI_FLASH_SUPPORT_BOYA_CHIP is not set
+-# CONFIG_SPI_FLASH_SUPPORT_TH_CHIP is not set
++CONFIG_SPI_FLASH_SUPPORT_BOYA_CHIP=y
++CONFIG_SPI_FLASH_SUPPORT_TH_CHIP=y
++CONFIG_SPI_FLASH_SUPPORT_MXIC_OPI_CHIP=y
+ # end of Auto-detect flash chips
+ 
+ CONFIG_SPI_FLASH_ENABLE_ENCRYPTED_READ_WRITE=y
+@@ -1871,6 +2090,34 @@ CONFIG_UNITY_ENABLE_IDF_TEST_RUNNER=y
+ # CONFIG_UNITY_ENABLE_BACKTRACE_ON_FAIL is not set
+ # end of Unity unit testing library
+ 
++#
++# USB-OTG
++#
++CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=256
++CONFIG_USB_HOST_HW_BUFFER_BIAS_BALANCED=y
++# CONFIG_USB_HOST_HW_BUFFER_BIAS_IN is not set
++# CONFIG_USB_HOST_HW_BUFFER_BIAS_PERIODIC_OUT is not set
++
++#
++# Hub Driver Configuration
++#
++
++#
++# Root Port configuration
++#
++CONFIG_USB_HOST_DEBOUNCE_DELAY_MS=250
++CONFIG_USB_HOST_RESET_HOLD_MS=30
++CONFIG_USB_HOST_RESET_RECOVERY_MS=30
++CONFIG_USB_HOST_SET_ADDR_RECOVERY_MS=10
++# end of Root Port configuration
++
++# CONFIG_USB_HOST_HUBS_SUPPORTED is not set
++# end of Hub Driver Configuration
++
++# CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK is not set
++CONFIG_USB_OTG_SUPPORTED=y
++# end of USB-OTG
++
+ #
+ # Virtual file system
+ #
+@@ -1959,6 +2206,17 @@ CONFIG_ESPNOW_OTA_WAIT_RESPONSE_TIMEOUT=10000
+ # CONFIG_ESPNOW_AUTO_RESTORE_CHANNEL is not set
+ # CONFIG_ESPNOW_DATA_FAST_ACK is not set
+ 
++#
++# ESP-NOW Task Configuration
++#
++
++#
++# Avoid heavy processing in handlers; offload to app task via queues.
++#
++CONFIG_ESPNOW_TASK_STACK_SIZE=4096
++CONFIG_ESPNOW_TASK_PRIORITY=1
++# end of ESP-NOW Task Configuration
++
+ #
+ # ESP-NOW Utils Configuration
+ #
+@@ -2005,7 +2263,7 @@ CONFIG_ESPNOW_DEBUG_CONSOLE_UART_NUM=0
+ #
+ CONFIG_I2C_BUS_DYNAMIC_CONFIG=y
+ CONFIG_I2C_MS_TO_WAIT=200
+-CONFIG_I2C_BUS_BACKWARD_CONFIG=y
++# CONFIG_I2C_BUS_BACKWARD_CONFIG is not set
+ # CONFIG_I2C_BUS_SUPPORT_SOFTWARE is not set
+ # CONFIG_I2C_BUS_REMOVE_NULL_MEM_ADDR is not set
+ # end of I2C Bus Options
+@@ -2035,7 +2293,7 @@ CONFIG_LV_COLOR_CHROMA_KEY_HEX=0x00FF00
+ # Memory settings
+ #
+ # CONFIG_LV_MEM_CUSTOM is not set
+-CONFIG_LV_MEM_SIZE_KILOBYTES=64
++CONFIG_LV_MEM_SIZE_KILOBYTES=32
+ CONFIG_LV_MEM_ADDR=0x0
+ CONFIG_LV_MEM_BUF_MAX_NUM=16
+ # CONFIG_LV_MEMCPY_MEMSET_STD is not set
+@@ -2131,7 +2389,7 @@ CONFIG_LV_ATTRIBUTE_MEM_ALIGN_SIZE=1
+ # CONFIG_LV_FONT_MONTSERRAT_12 is not set
+ CONFIG_LV_FONT_MONTSERRAT_14=y
+ # CONFIG_LV_FONT_MONTSERRAT_16 is not set
+-CONFIG_LV_FONT_MONTSERRAT_18=y
++# CONFIG_LV_FONT_MONTSERRAT_18 is not set
+ # CONFIG_LV_FONT_MONTSERRAT_20 is not set
+ # CONFIG_LV_FONT_MONTSERRAT_22 is not set
+ # CONFIG_LV_FONT_MONTSERRAT_24 is not set
+@@ -2322,9 +2580,6 @@ CONFIG_LV_BUILD_EXAMPLES=y
+ # Deprecated options for backward compatibility
+ # CONFIG_APP_BUILD_TYPE_ELF_RAM is not set
+ # CONFIG_NO_BLOBS is not set
+-# CONFIG_ESP32_NO_BLOBS is not set
+-# CONFIG_ESP32_COMPATIBLE_PRE_V2_1_BOOTLOADERS is not set
+-# CONFIG_ESP32_COMPATIBLE_PRE_V3_1_BOOTLOADERS is not set
+ # CONFIG_LOG_BOOTLOADER_LEVEL_NONE is not set
+ # CONFIG_LOG_BOOTLOADER_LEVEL_ERROR is not set
+ # CONFIG_LOG_BOOTLOADER_LEVEL_WARN is not set
+@@ -2357,7 +2612,9 @@ CONFIG_STACK_CHECK_NONE=y
+ # CONFIG_ESP32_APPTRACE_DEST_TRAX is not set
+ CONFIG_ESP32_APPTRACE_DEST_NONE=y
+ CONFIG_ESP32_APPTRACE_LOCK_ENABLE=y
+-CONFIG_ADC2_DISABLE_DAC=y
++# CONFIG_EXTERNAL_COEX_ENABLE is not set
++# CONFIG_ESP_WIFI_EXTERNAL_COEXIST_ENABLE is not set
++# CONFIG_CAM_CTLR_DVP_CAM_ISR_IRAM_SAFE is not set
+ # CONFIG_MCPWM_ISR_IN_IRAM is not set
+ # CONFIG_EVENT_LOOP_PROFILING is not set
+ CONFIG_POST_EVENTS_FROM_ISR=y
+@@ -2365,42 +2622,27 @@ CONFIG_POST_EVENTS_FROM_IRAM_ISR=y
+ CONFIG_GDBSTUB_SUPPORT_TASKS=y
+ CONFIG_GDBSTUB_MAX_TASKS=32
+ # CONFIG_OTA_ALLOW_HTTP is not set
+-# CONFIG_TWO_UNIVERSAL_MAC_ADDRESS is not set
+-CONFIG_FOUR_UNIVERSAL_MAC_ADDRESS=y
+-CONFIG_NUMBER_OF_UNIVERSAL_MAC_ADDRESS=4
+ # CONFIG_ESP_SYSTEM_PD_FLASH is not set
+-CONFIG_ESP32_DEEP_SLEEP_WAKEUP_DELAY=2000
++CONFIG_ESP32S3_DEEP_SLEEP_WAKEUP_DELAY=2000
+ CONFIG_ESP_SLEEP_DEEP_SLEEP_WAKEUP_DELAY=2000
+-CONFIG_ESP32_RTC_CLK_SRC_INT_RC=y
+-CONFIG_ESP32_RTC_CLOCK_SOURCE_INTERNAL_RC=y
+-# CONFIG_ESP32_RTC_CLK_SRC_EXT_CRYS is not set
+-# CONFIG_ESP32_RTC_CLOCK_SOURCE_EXTERNAL_CRYSTAL is not set
+-# CONFIG_ESP32_RTC_CLK_SRC_EXT_OSC is not set
+-# CONFIG_ESP32_RTC_CLOCK_SOURCE_EXTERNAL_OSC is not set
+-# CONFIG_ESP32_RTC_CLK_SRC_INT_8MD256 is not set
+-# CONFIG_ESP32_RTC_CLOCK_SOURCE_INTERNAL_8MD256 is not set
+-CONFIG_ESP32_RTC_CLK_CAL_CYCLES=1024
+-# CONFIG_ESP32_XTAL_FREQ_26 is not set
+-CONFIG_ESP32_XTAL_FREQ_40=y
+-# CONFIG_ESP32_XTAL_FREQ_AUTO is not set
+-CONFIG_ESP32_XTAL_FREQ=40
++CONFIG_ESP32S3_RTC_CLK_SRC_INT_RC=y
++# CONFIG_ESP32S3_RTC_CLK_SRC_EXT_CRYS is not set
++# CONFIG_ESP32S3_RTC_CLK_SRC_EXT_OSC is not set
++# CONFIG_ESP32S3_RTC_CLK_SRC_INT_8MD256 is not set
++CONFIG_ESP32S3_RTC_CLK_CAL_CYCLES=1024
+ CONFIG_ESP32_PHY_CALIBRATION_AND_DATA_STORAGE=y
+ # CONFIG_ESP32_PHY_INIT_DATA_IN_PARTITION is not set
+ CONFIG_ESP32_PHY_MAX_WIFI_TX_POWER=20
+ CONFIG_ESP32_PHY_MAX_TX_POWER=20
+ # CONFIG_REDUCE_PHY_TX_POWER is not set
+ # CONFIG_ESP32_REDUCE_PHY_TX_POWER is not set
+-# CONFIG_SPIRAM_SUPPORT is not set
+-# CONFIG_ESP32_SPIRAM_SUPPORT is not set
+-# CONFIG_ESP32_DEFAULT_CPU_FREQ_80 is not set
+-CONFIG_ESP32_DEFAULT_CPU_FREQ_160=y
+-# CONFIG_ESP32_DEFAULT_CPU_FREQ_240 is not set
+-CONFIG_ESP32_DEFAULT_CPU_FREQ_MHZ=160
+-CONFIG_TRACEMEM_RESERVE_DRAM=0x0
+-# CONFIG_ESP32_PANIC_PRINT_HALT is not set
+-CONFIG_ESP32_PANIC_PRINT_REBOOT=y
+-# CONFIG_ESP32_PANIC_SILENT_REBOOT is not set
+-# CONFIG_ESP32_PANIC_GDBSTUB is not set
++CONFIG_ESP_SYSTEM_PM_POWER_DOWN_CPU=y
++CONFIG_PM_POWER_DOWN_TAGMEM_IN_LIGHT_SLEEP=y
++# CONFIG_ESP32S3_SPIRAM_SUPPORT is not set
++# CONFIG_ESP32S3_DEFAULT_CPU_FREQ_80 is not set
++CONFIG_ESP32S3_DEFAULT_CPU_FREQ_160=y
++# CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240 is not set
++CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ=160
+ CONFIG_SYSTEM_EVENT_QUEUE_SIZE=32
+ CONFIG_SYSTEM_EVENT_TASK_STACK_SIZE=2304
+ CONFIG_MAIN_TASK_STACK_SIZE=3584
+@@ -2421,29 +2663,26 @@ CONFIG_TASK_WDT_TIMEOUT_S=5
+ CONFIG_TASK_WDT_CHECK_IDLE_TASK_CPU0=y
+ CONFIG_TASK_WDT_CHECK_IDLE_TASK_CPU1=y
+ # CONFIG_ESP32_DEBUG_STUBS_ENABLE is not set
+-CONFIG_ESP32_DEBUG_OCDAWARE=y
++CONFIG_ESP32S3_DEBUG_OCDAWARE=y
+ CONFIG_BROWNOUT_DET=y
+-CONFIG_ESP32_BROWNOUT_DET=y
+-CONFIG_BROWNOUT_DET_LVL_SEL_0=y
+-CONFIG_ESP32_BROWNOUT_DET_LVL_SEL_0=y
+-# CONFIG_BROWNOUT_DET_LVL_SEL_1 is not set
+-# CONFIG_ESP32_BROWNOUT_DET_LVL_SEL_1 is not set
+-# CONFIG_BROWNOUT_DET_LVL_SEL_2 is not set
+-# CONFIG_ESP32_BROWNOUT_DET_LVL_SEL_2 is not set
+-# CONFIG_BROWNOUT_DET_LVL_SEL_3 is not set
+-# CONFIG_ESP32_BROWNOUT_DET_LVL_SEL_3 is not set
+-# CONFIG_BROWNOUT_DET_LVL_SEL_4 is not set
+-# CONFIG_ESP32_BROWNOUT_DET_LVL_SEL_4 is not set
+-# CONFIG_BROWNOUT_DET_LVL_SEL_5 is not set
+-# CONFIG_ESP32_BROWNOUT_DET_LVL_SEL_5 is not set
++CONFIG_ESP32S3_BROWNOUT_DET=y
++CONFIG_BROWNOUT_DET_LVL_SEL_7=y
++CONFIG_ESP32S3_BROWNOUT_DET_LVL_SEL_7=y
+ # CONFIG_BROWNOUT_DET_LVL_SEL_6 is not set
+-# CONFIG_ESP32_BROWNOUT_DET_LVL_SEL_6 is not set
+-# CONFIG_BROWNOUT_DET_LVL_SEL_7 is not set
+-# CONFIG_ESP32_BROWNOUT_DET_LVL_SEL_7 is not set
+-CONFIG_BROWNOUT_DET_LVL=0
+-CONFIG_ESP32_BROWNOUT_DET_LVL=0
+-# CONFIG_DISABLE_BASIC_ROM_CONSOLE is not set
+-CONFIG_IPC_TASK_STACK_SIZE=1024
++# CONFIG_ESP32S3_BROWNOUT_DET_LVL_SEL_6 is not set
++# CONFIG_BROWNOUT_DET_LVL_SEL_5 is not set
++# CONFIG_ESP32S3_BROWNOUT_DET_LVL_SEL_5 is not set
++# CONFIG_BROWNOUT_DET_LVL_SEL_4 is not set
++# CONFIG_ESP32S3_BROWNOUT_DET_LVL_SEL_4 is not set
++# CONFIG_BROWNOUT_DET_LVL_SEL_3 is not set
++# CONFIG_ESP32S3_BROWNOUT_DET_LVL_SEL_3 is not set
++# CONFIG_BROWNOUT_DET_LVL_SEL_2 is not set
++# CONFIG_ESP32S3_BROWNOUT_DET_LVL_SEL_2 is not set
++# CONFIG_BROWNOUT_DET_LVL_SEL_1 is not set
++# CONFIG_ESP32S3_BROWNOUT_DET_LVL_SEL_1 is not set
++CONFIG_BROWNOUT_DET_LVL=7
++CONFIG_ESP32S3_BROWNOUT_DET_LVL=7
++CONFIG_IPC_TASK_STACK_SIZE=1280
+ CONFIG_TIMER_TASK_STACK_SIZE=3584
+ CONFIG_ESP32_WIFI_ENABLED=y
+ CONFIG_ESP32_WIFI_STATIC_RX_BUFFER_NUM=10
+@@ -2469,6 +2708,7 @@ CONFIG_ESP32_WIFI_ENABLE_WPA3_OWE_STA=y
+ CONFIG_WPA_MBEDTLS_CRYPTO=y
+ CONFIG_WPA_MBEDTLS_TLS_CLIENT=y
+ # CONFIG_WPA_WAPI_PSK is not set
++# CONFIG_WPA_SUITE_B_192 is not set
+ # CONFIG_WPA_11KV_SUPPORT is not set
+ # CONFIG_WPA_MBO_SUPPORT is not set
+ # CONFIG_WPA_DPP_SUPPORT is not set
+@@ -2476,7 +2716,6 @@ CONFIG_WPA_MBEDTLS_TLS_CLIENT=y
+ # CONFIG_WPA_WPS_SOFTAP_REGISTRAR is not set
+ # CONFIG_WPA_WPS_STRICT is not set
+ # CONFIG_WPA_DEBUG_PRINT is not set
+-# CONFIG_WPA_TESTING_OPTIONS is not set
+ # CONFIG_ESP32_ENABLE_COREDUMP_TO_FLASH is not set
+ # CONFIG_ESP32_ENABLE_COREDUMP_TO_UART is not set
+ CONFIG_ESP32_ENABLE_COREDUMP_TO_NONE=y
+@@ -2507,12 +2746,12 @@ CONFIG_TCPIP_TASK_AFFINITY_NO_AFFINITY=y
+ # CONFIG_TCPIP_TASK_AFFINITY_CPU1 is not set
+ CONFIG_TCPIP_TASK_AFFINITY=0x7FFFFFFF
+ # CONFIG_PPP_SUPPORT is not set
+-CONFIG_ESP32_TIME_SYSCALL_USE_RTC_HRT=y
+-CONFIG_ESP32_TIME_SYSCALL_USE_RTC_FRC1=y
+-# CONFIG_ESP32_TIME_SYSCALL_USE_RTC is not set
+-# CONFIG_ESP32_TIME_SYSCALL_USE_HRT is not set
+-# CONFIG_ESP32_TIME_SYSCALL_USE_FRC1 is not set
+-# CONFIG_ESP32_TIME_SYSCALL_USE_NONE is not set
++CONFIG_ESP32S3_TIME_SYSCALL_USE_RTC_SYSTIMER=y
++CONFIG_ESP32S3_TIME_SYSCALL_USE_RTC_FRC1=y
++# CONFIG_ESP32S3_TIME_SYSCALL_USE_RTC is not set
++# CONFIG_ESP32S3_TIME_SYSCALL_USE_SYSTIMER is not set
++# CONFIG_ESP32S3_TIME_SYSCALL_USE_FRC1 is not set
++# CONFIG_ESP32S3_TIME_SYSCALL_USE_NONE is not set
+ CONFIG_ESP32_PTHREAD_TASK_PRIO_DEFAULT=5
+ CONFIG_ESP32_PTHREAD_TASK_STACK_SIZE_DEFAULT=3072
+ CONFIG_ESP32_PTHREAD_STACK_MIN=768
+@@ -2524,7 +2763,6 @@ CONFIG_ESP32_PTHREAD_TASK_NAME_DEFAULT="pthread"
+ CONFIG_SPI_FLASH_WRITING_DANGEROUS_REGIONS_ABORTS=y
+ # CONFIG_SPI_FLASH_WRITING_DANGEROUS_REGIONS_FAILS is not set
+ # CONFIG_SPI_FLASH_WRITING_DANGEROUS_REGIONS_ALLOWED is not set
+-# CONFIG_ESP32_ULP_COPROC_ENABLED is not set
+ CONFIG_SUPPRESS_SELECT_DEBUG_OUTPUT=y
+ CONFIG_SUPPORT_TERMIOS=y
+ CONFIG_SEMIHOSTFS_MAX_MOUNT_POINTS=1
