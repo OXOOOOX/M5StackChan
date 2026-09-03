@@ -47,6 +47,7 @@ git clone --branch codex/v0.1.0-safe-receiver --recurse-submodules https://githu
 
 ## 文档导航
 
+- [归档交接与恢复入口](docs/project_handoff_zh.md)：聊天归档后从这里继续，含两个仓库的发布位置与兼容性区别。
 - [排错经验总集与聊天证据](docs/debugging_lessons_zh.md)：过程、失败方案、已确认结果、后续验收。
 - [常见故障速查](docs/troubleshooting.md)、[环境搭建](docs/setup.md)、[ESP-NOW 协议](docs/protocol.md)。
 - [舵机供电发现过程](docs/servo_power_debug.md)、[更换舵机与 ID 恢复](docs/servo_replacement_debug_zh.md)。

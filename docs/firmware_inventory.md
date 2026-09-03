@@ -41,7 +41,7 @@ StackChan-RemoteControl-StickS3-Joystick2_0x6.bin
 
 该分支还保存完整源码补丁和打包说明，见[远端分支](https://github.com/OXOOOOX/M5StackChan/tree/codex/sticks3-joystick2-remote)。它的文档声明合并镜像使用刷写地址 `0x0`；`_0x6` 是文件版本命名，不能直接当刷写地址。本次未刷写或重建该固件。
 
-兄弟遥控器仓库在后续会话继续更新过源代码和 bin；不能仅凭文件名把那里的最新实测结果归到本分支产物上。
+归档前已核对兄弟遥控器仓库的 `b61fae0` 固件发布在远端 main；后续还补齐了主补丁遗漏的两个反转设置界面源码。该版本使用高层组件封装，与本库 `2ce2b47` 的原生 ESP-NOW 路线不同。不能仅凭文件名把最新实测结果归到本分支产物上，详见[归档交接](project_handoff_zh.md)。
 
 ## 后续发布每个 bin 必填
 
