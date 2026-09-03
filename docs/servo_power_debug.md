@@ -1,5 +1,9 @@
 # Servo Power Debug Notes
 
+> 2026-09-03 evidence review: this is a historical experiment, not acceptance of
+> both axes or the current remote controller. The user confirmed slight motion
+> after VM_EN was enabled. See [the consolidated review](debugging_lessons_zh.md).
+
 This note records why the UIFlow2 servo test did not move the StackChan motors until `VM_EN` was enabled.
 
 ## Summary
@@ -63,15 +67,19 @@ Observed sequence:
    FF FF ...
    ```
 
-7. After enabling PY32 `VM_EN`, the device reported:
+7. After enabling PY32 `VM_EN`, the user transcribed:
 
    ```text
-   PY32 version 0x41
-   id1 len=6 FF FF 01 02 00 FB
-   id2 len=6 FF FF 01 02 00 FC
+   0x41
+   6 FF FF 01 02 00 FB
+   6 FF FF 01 02 00 FC
    ```
 
-8. After `VM_EN` was enabled and the servo bus returned valid `FF FF ...` packets, the yaw servo moved slightly during the yaw sequence test.
+   Both transcribed packets contain ID `1`. The first has an inconsistent
+   checksum for that ID; the second is a valid ID1 status packet. Do not silently
+   change the first ID to `2` or count this as proof that both servos passed ping.
+
+8. After `VM_EN` was enabled, the user confirmed slight movement during the yaw sequence test. Later dual-ID recovery has separate evidence in [the replacement record](servo_replacement_debug_zh.md).
 
 Conclusion: servo UART and SCSCL packet writes were basically correct, but the servo power rail was not enabled until PY32 `VM_EN` was set.
 
@@ -135,7 +143,10 @@ Do not integrate live remote servo control until the receiver script performs th
 2. Wait for user action.
 3. Enable PY32 `VM_EN`.
 4. Ping ID `1` and/or ID `2`.
-5. If no valid `FF FF ...` response, show an error and do not send motion commands.
+5. Validate header, target ID, length, error code and checksum; a `FF FF` prefix alone is insufficient. If validation fails, show an error and do not send motion commands.
 6. If valid, enable controlled motion.
 
 This prevents confusing ESP-NOW, UI, UART, and motor power problems during future debugging.
+
+This sequence is a design requirement. The current remote prototype still has
+partial ping validation and unguarded home commands; see [known limitations](remote_control.md).

@@ -39,9 +39,9 @@ def init_espnow():
 
 
 def parse_packet(packet):
-    if len(packet) < 8:
-        return "short packet len={}".format(len(packet))
-    target_id, yaw, pitch, speed, laser = struct.unpack("<BhhhB", packet[:8])
+    if len(packet) != 8:
+        return "ignore packet len={}".format(len(packet))
+    target_id, yaw, pitch, speed, laser = struct.unpack("<BhhhB", packet)
     return "id:{} yaw:{} pitch:{} speed:{} laser:{}".format(target_id, yaw, pitch, speed, laser)
 
 

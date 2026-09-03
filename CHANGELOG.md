@@ -1,20 +1,37 @@
-# Changelog
+# 变更记录
 
-## v0.1.0
+版本号表示开发阶段；截至 2026-09-03 未发现 Git tag。
 
-Initial safe receiver UI release.
+## 开发分支更新：仓库整理与经验复核（2026-09-03，无正式 tag）
 
-### Added
+- 整理 GitHub 上传清单、固件来源/哈希和远端分支冲突报告。
+- 基于完整项目会话与前期 UIFlow 讨论汇总排错经验，区分实机证据、代码实现和未确认推断。
+- 修正文档中的驱动/映射参数漂移、广播 ID、回位/断电保证和完成状态。
+- 扩充本机环境、日志、聊天导出和新固件产物的忽略规则；已有二进制仍保留且受 Git 跟踪。
+- 本次整理没有改动运动控制逻辑，也没有完成新的实机测试。
 
-- UIFlow2 ESP-NOW remote packet listener.
-- Touch `Stop timer` button for continuous listening.
-- Touch `Exit` button for immediate stop.
-- `BtnA` fallback for stopping the countdown.
-- Countdown auto-stop.
-- Receiver ID diagnostics using `rx`, `ignored`, and `rx short` display prefixes.
-- Setup, protocol, and troubleshooting documentation.
+## v0.3.0 遥控原型（开发中）
 
-### Notes
+- 新增 `uiflow2/remote_servo_controller.py`，内嵌驱动和 MotionMapper，可整体粘贴到 UIFlow2。
+- 新增 `uiflow2/lib/motion.py`，作为早期模块化映射原型；当前自包含脚本已经采用不同逻辑。
+- 当前遥控脚本要求恰好 8 字节并检查字段范围、ID，yaw 使用 raw 增量/取模，pitch 使用单侧映射和平滑。
+- 提供 Start/Stop/Exit、空闲回位尝试及命令节流；可靠性限制见 [遥控文档](docs/remote_control.md)。
+- 连续旋转曾发生异响/失控，后续双舵机通信和校准恢复不能当成此原型的完整验收。
 
-- Servo motion is not enabled in this release.
-- Experimental direct-control scripts are kept under `uiflow2/experimental/` and are not recommended for normal use.
+## v0.2.0 舵机驱动探索（原型）
+
+- 新增 `uiflow2/lib/servo.py` 和自包含 `uiflow2/servo_validation.py`。
+- 提供 VM_EN 供电、UART、ping、位置指令和清理流程。
+- 旧角度换算与回包校验仍待处理，不称为已验证的安全驱动；见 [API 文档](docs/servo_api.md)。
+
+## v0.1.0 后续诊断与报文保护
+
+- 已提交：VM_EN 发现、最小舵机实验、总线诊断、pitch ID 恢复和中心校准工具。
+- 已有用户实机反馈：双 ID 通信、Jog、中心校准成功。
+- 后续修改：两个监听脚本只接收恰好 8 字节；倒计时监听器增加字段范围过滤。
+
+## v0.1.0 监听阶段
+
+- ESP-NOW 监听与触摸 UI、倒计时、`Stop timer`、`Exit`、`BtnA` 备用操作。
+- 接收端 ID 诊断、环境搭建、协议和排错说明。
+- 该监听脚本不驱动舵机；早期直接控制代码保存在 `uiflow2/experimental/`。

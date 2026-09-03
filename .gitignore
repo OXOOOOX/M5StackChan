@@ -1,2 +1,23 @@
 __pycache__/
 *.pyc
+
+# Local Python environments and build output
+.venv/
+venv/
+.pio/
+/build/
+/dist/
+
+# Local credentials, machine settings and debug captures
+.env
+.env.*
+!.env.example
+*.local.json
+*.local.toml
+*.log
+/logs/
+/chat_exports/
+/local_notes/
+
+# Tracked historical binaries remain tracked. New binaries need review.
+*.bin

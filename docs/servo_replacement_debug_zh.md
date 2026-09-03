@@ -2,6 +2,8 @@
 
 本文整理本次排查过程、换舵机注意事项，以及 StackChan 串行舵机的通信规则。适用于 UIFlow2 脚本环境。
 
+2026-09-03 复核：这里的成功结论限于 2026-05-10 的双 ID 通信、Jog 和中心校准。持续遥控/无限旋转没有新的完整验收证据，详见[排错经验总集](debugging_lessons_zh.md)。
+
 ## 相关脚本
 
 - `uiflow2/servo_bus_diagnostic.py`
@@ -91,7 +93,7 @@ found config u1 tx6 rx7 1000000 ids [1, 2]
 ids [1]
 ```
 
-说明只发现 yaw/ID1，pitch/ID2 没有出现在总线上。
+说明只发现逻辑 ID1，ID2 没有出现在总线上。不能据此确定响应者一定是底座 yaw：新 pitch 也可能是 ID1，两个相同 ID 的舵机更无法仅凭扫描计数区分。
 
 ### 2. 分别 Jog
 

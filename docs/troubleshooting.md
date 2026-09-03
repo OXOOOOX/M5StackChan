@@ -1,52 +1,35 @@
-# Troubleshooting
+# 常见故障速查
 
-## Screen Shows `waiting for remote...`
+完整过程和证据等级见[排错经验总集](debugging_lessons_zh.md)。以下步骤从不运动的诊断开始。
 
-Check:
+| 现象 | 先看什么 | 处理与判断边界 |
+| --- | --- | --- |
+| `ImportError: no module named 'm5stack'` | 当前固件/API | 本项目使用 UIFlow2 的 `M5`、`Widgets`，不能套用 UIFlow1 示例 |
+| 黑屏/卡死 | 最小 UI、触摸、UART 分别运行 | 回到监听器；若启动脚本导致循环故障，再恢复 UIFlow2 固件。历史没有唯一根因 |
+| 一启动就 `stopped` | 触摸计数/按压状态与坐标 | 松手后的旧坐标不等于正在触摸；需有效按压、单次触发和启动隔离 |
+| `SyntaxError` 在文件尾 | 完整文件、缩进、`except/finally` | 优先排除粘贴截断；不能把所有语法错误都归因截断 |
+| `waiting for remote...` | 发送端 Running、实际信道、长度 | 用报文监听器缩小问题范围；未显示不等于完全没收包 |
+| `ignored id:X` | 目标 ID | 接收端设为 X，或发送端目标设为 0；接收端设 0 不能接所有 ID |
+| `ignore len=28` | 高层组件封装 vs 原生 ESP-NOW | 核对原生 8 字节发送；不要盲目截取前 8 字节 |
+| yaw 为几千/几万 | 发送端 y/p 与接收 hex | 检查 Joystick2 原始范围、int32 中间计算、完整填包；越界包不驱动 |
+| UI 数字变而舵机不动 | VM_EN、有效 ping | UI 成功、UART 写成功和机械动作是不同验收点 |
+| `C0 C0 00` 或仅 `FF FF` | 完整应答 | 查供电，再查长度/目标 ID/错误码/checksum；任意字节不代表通信成功 |
+| 只有 `ids [1]` | 单个舵机隔离扫描 | 只能证明逻辑 ID1；替换 pitch 也可能默认 ID1 |
+| 换 pitch 后 `no servo` | EEPROM ID | 断电并隔离新舵机，专用脚本将 1 改为 2，再接回两台确认 [1,2] |
+| `PY32 post-write read failed: 259` | 后续 ping/动作 | 单条读回失败不能直接证明 VM_EN 未打开；保留原日志，继续验证总线 |
+| 中心/行程异常 | 本机校准值、raw 边界 | 官方 460/620 与当前原型 510/610 不是通用常数 |
+| 持续旋转、异响、堵转 | 立即停止供电 | 停止反复跑大幅度测试，回到 ID/小幅 Jog/校准；当前连续旋转未验收 |
+| 失联不回位 | 非 8 字节流是否持续到达 | 当前原型提前 `continue` 可跳过超时，这是待修复代码问题 |
+| 网页 UART 连不上 | 是否已有终端占用串口 | 关闭占用者再试；历史案例没有完成重连对照，不能认定唯一根因 |
 
-- Remote is in ESP-NOW running mode.
-- `WIFI_CHANNEL` matches the remote channel.
-- StackChan and remote are close enough.
-- Use `uiflow2/espnow_packet_monitor.py` to confirm raw packets.
+## 最小排查顺序
 
-## Screen Shows `ignored id:X`
+1. 固件/API 与完整脚本。
+2. UI 和触摸状态。
+3. 无运动报文监听：长度 → 字段范围 → ID → 信道。
+4. 舵机供电：PY32 `0x6F`、VM_EN pin0。
+5. UART1 `G6/G7`、1 Mbaud、完整有效应答。
+6. 单轴隔离 ID、小幅 Jog、中心校准。
+7. 在限幅与异常处理修复后，才进入遥控集成。
 
-The receiver is getting packets, but the target ID does not match.
-
-Fix one side:
-
-```python
-RECEIVER_ID = X
-```
-
-or configure the remote target ID to `0` for broadcast.
-
-## Device Stops Immediately
-
-This usually means an old touch coordinate was interpreted as a button press, or the script was pasted partially.
-
-Use the latest `remote_countdown_monitor_safe.py`, and paste the entire file including the final `try/except` block.
-
-## `SyntaxError` Near `try: main()`
-
-The script was not pasted completely. The end must include the matching `except` block:
-
-```python
-try:
-    main()
-except (Exception, KeyboardInterrupt) as e:
-    ...
-```
-
-## Touch Button Does Not Respond
-
-The current script reads `M5.Touch` and only triggers when the touch count is active. If the touch area feels off, adjust:
-
-```python
-STOP_TIMER_RECT = (8, 156, 150, 44)
-EXIT_RECT = (176, 156, 136, 44)
-```
-
-## Black Screen or Freeze
-
-Avoid `uiflow2/experimental/` scripts. Use M5Burner to re-flash UIFlow2 if a downloaded script causes boot-time freezes.
+[供电发现过程](servo_power_debug.md)和[更换舵机指南](servo_replacement_debug_zh.md)保留了具体日志；[遥控文档](remote_control.md)列出当前代码限制。

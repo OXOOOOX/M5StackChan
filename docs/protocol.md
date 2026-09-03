@@ -1,31 +1,52 @@
-# ESP-NOW Protocol
+# ESP-NOW 协议与校验
 
-The receiver expects the same 8-byte packet format used by the StackChan ESP-NOW remote firmware:
+本项目 UIFlow2 接收端要求应用载荷**恰好 8 字节**，使用 `struct.unpack("<BhhhB", packet)` 解码。ESP-NOW 传输层与所选组件的封装要分别核对。
+
+| 偏移 | 长度 | 类型 | 含义/接受范围 |
+| --- | ---: | --- | --- |
+| 0 | 1 | uint8 | 目标 ID；`0` 为发送端广播目标 |
+| 1 | 2 | int16，小端 | yaw 输入，`-1280..1280` |
+| 3 | 2 | int16，小端 | pitch 输入，`0..900` |
+| 5 | 2 | int16，小端 | speed 输入，`0..1000` |
+| 7 | 1 | uint8 | laser/额外按钮标志；当前脚本仅展示 |
+
+这些是传输字段，不直接等于机械角度。当前遥控脚本的 yaw 是 raw 增量，pitch 是按中心值计算的单侧角度，见[遥控文档](remote_control.md)。
+
+## 校验顺序
+
+1. 先判断 `len(packet) == 8`；短包、长包都拒绝，不能截取长包前 8 字节冒充有效数据。
+2. 按小端解码，校验 yaw/pitch/speed 范围。
+3. 验证目标 ID：接收端 ID 一致，或允许广播且发送端目标为 `0`。
+4. 通过后才更新有效控制状态；通信失败与运动失败分开判断。
+
+`remote_countdown_monitor_safe.py` 与 `remote_servo_controller.py` 有范围过滤。`espnow_packet_monitor.py` 仅要求等长，展示原始字段，以便观察异常。
+
+设置接收端 `RECEIVER_ID = 0` **不表示接收所有 ID**。当前匹配函数仍只接受相同 ID 或发送端目标 `0`。
+
+## 报文示例
 
 ```text
-[target-id][yaw int16][pitch int16][speed int16][laser uint8]
+01 00 00 C2 01 58 02 00
+target=1, yaw=0, pitch=450, speed=600, laser=0
 ```
 
-Fields:
+倒计时监听器前缀：
 
-| Offset | Size | Type | Description |
-| --- | ---: | --- | --- |
-| 0 | 1 | uint8 | Target receiver ID. `0` means broadcast. |
-| 1 | 2 | int16 little-endian | Yaw angle. Typical range: `-1280` to `1280`. |
-| 3 | 2 | int16 little-endian | Pitch angle. Typical range: `0` to `900`. |
-| 5 | 2 | int16 little-endian | Speed. Typical range: `0` to `1000`. |
-| 7 | 1 | uint8 | Laser or extra button flag. `0` off, non-zero on. |
+| 前缀 | 含义 |
+| --- | --- |
+| `rx` | 长度/范围正常且 ID 匹配 |
+| `ignored id:X` | 收到正常字段，但目标 ID 不匹配 |
+| `ignore len=N` | 非 8 字节，未解析 |
+| `invalid id:...` | 字段越界，未作为正常输入 |
 
-The v0.1.0 receiver only displays these values. Servo motion is intentionally not enabled in this release.
+## 28 字节封装与发送端
 
-Example parser:
+历史实测出现过 28 字节包。遥控器分支的调试说明把这种现象与 Espressif 高层组件 `espnow_send(ESPNOW_DATA_TYPE_DATA, ...)` 的封装关联，并改用原生 `esp_now_send(...)` 发送 8 字节载荷。不过会话没有闭环识别每个异常长包的实际来源，不能一概归因于第三方设备或某个组件。排查时比较发送前 y/p、接收长度和十六进制原文，不靠随意调整偏移掩盖不匹配。
 
-```python
-target_id, yaw, pitch, speed, laser = struct.unpack("<BhhhB", packet[:8])
-```
+这是项目中的兼容性修复，不能据此声称所有名为 ESP-NOW 的固件都兼容。固定官方子模块的历史接收实现接受 `size() >= 8`；“严格等于 8 且过滤越界”是本项目新增约束。
 
-Packet display prefixes:
+## 与舵机串口的区别
 
-- `rx`: packet matches `RECEIVER_ID` or broadcast ID `0`.
-- `ignored`: packet was received, but target ID did not match.
-- `rx short`: packet was shorter than 8 bytes.
+ESP-NOW 字段是小端。SCSCL 位置、时间、速度的 16 位参数在固定官方驱动中高字节在前。这是两套协议，不能共用未经区分的字节转换。
+
+舵机应答还需验证 ID、长度、错误码和 checksum；看见 `FF FF` 不能证明有效。详见[排错总集](debugging_lessons_zh.md)。

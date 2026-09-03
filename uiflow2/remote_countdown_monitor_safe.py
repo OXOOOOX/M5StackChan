@@ -11,6 +11,12 @@ RECEIVER_ID = 1
 WIFI_CHANNEL = 1
 RUN_SECONDS = 30
 RESET_ON_EXIT = False
+YAW_MIN = -1280
+YAW_MAX = 1280
+PITCH_MIN = 0
+PITCH_MAX = 900
+SPEED_MIN = 0
+SPEED_MAX = 1000
 
 
 running = True
@@ -65,9 +71,15 @@ def init_espnow():
 
 
 def parse_remote_packet(packet):
-    if len(packet) < 8:
-        return "rx short len={}".format(len(packet))
-    target_id, yaw, pitch, speed, laser = struct.unpack("<BhhhB", packet[:8])
+    if len(packet) != 8:
+        return "ignore len={}".format(len(packet))
+    target_id, yaw, pitch, speed, laser = struct.unpack("<BhhhB", packet)
+    if (yaw < YAW_MIN or yaw > YAW_MAX or
+            pitch < PITCH_MIN or pitch > PITCH_MAX or
+            speed < SPEED_MIN or speed > SPEED_MAX):
+        return "invalid id:{} yaw:{} pitch:{} speed:{}".format(
+            target_id, yaw, pitch, speed
+        )
     match = target_id == 0 or target_id == RECEIVER_ID
     prefix = "rx" if match else "ignored"
     return "{} id:{} yaw:{} pitch:{} speed:{} laser:{}".format(
